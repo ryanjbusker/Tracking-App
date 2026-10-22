@@ -323,10 +323,16 @@ h1, h2, h3, p { margin: 0; }
 .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 16px; }
 .stat { background: var(--surface-2); border-radius: 14px; padding: 10px 10px 9px; min-width: 0; }
 .stat small { display: block; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
-.stat b { display: block; font-family: var(--mono); font-size: 20px; font-weight: 700; letter-spacing: -0.03em; margin-top: 2px; white-space: nowrap; }
+.stat b { display: block; font-family: var(--mono); font-size: clamp(15px, 4.6vw, 20px); font-weight: 700; letter-spacing: -0.03em; margin-top: 2px; white-space: nowrap; }
 .stat b u { text-decoration: none; font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 2px; }
 .panel-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; font-size: 13px; color: var(--muted); }
 .panel-foot > span:last-child { white-space: nowrap; }
+.sources { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.src { display: inline-flex; align-items: center; gap: 7px; padding: 6px 11px; border-radius: 999px; background: var(--surface-2); color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.src i { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
+.src.on { color: var(--text); }
+.src.on i { background: var(--live); }
+.src.warn i { background: var(--warn); }
 .panel .btn-row { margin-top: 14px; }
 .banner { margin-top: 12px; padding: 10px 12px; border-radius: 12px; font-size: 13px; background: var(--warn-soft); color: var(--warn); font-weight: 600; display: flex; gap: 8px; align-items: flex-start; }
 .banner svg { width: 16px; height: 16px; flex: none; margin-top: 1px; }

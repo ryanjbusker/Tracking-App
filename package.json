@@ -1,0 +1,13 @@
+{
+  "name": "contrail",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Live flight tracking for student pilots: ADS-B by tail number, with phone GPS backup.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

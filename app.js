@@ -2,12 +2,15 @@
 
 /* =========================================================================
    Contrail — live flight tracking for student pilots.
-   Pilot phone: GPS -> batched points -> ntfy.sh topic (no server needed).
-   Watchers: push alert (ntfy app) -> live map that streams the same topic.
+   Primary: ADS-B (transponder) by tail number, relayed by server.js.
+   Backup:  pilot phone GPS -> batched points -> ntfy.sh topic.
+   Watchers: push alert (ntfy app) -> live map that merges both sources.
    ========================================================================= */
 
 /* ---------- Config ---------- */
 const NTFY = 'https://ntfy.sh';
+const API = 'api';        // relative, served by server.js; missing on a static host and that's fine
+const ADSB_FRESH = 60;    // seconds an ADS-B position still counts as live
 const SAMPLE_SEC = 5;     // one track point every 5 s
 const MAX_PTS = 10;       // points per message, keeps each message small
 const HISTORY = '12h';    // ntfy.sh keeps messages ~12 h, so that is how far back watchers can see
@@ -151,6 +154,18 @@ const outbox = {
   },
 };
 window.addEventListener('online', () => outbox.flush());
+
+/* ---------- Contrail server (ADS-B relay) ---------- */
+async function apiGet(p) {
+  try {
+    const r = await fetch(`${API}${p}`, { cache: 'no-store' });
+    return r.ok ? await r.json() : null;
+  } catch { return null; }
+}
+function apiPost(p, body) {
+  return fetch(`${API}${p}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => {});
+}
+const adsbUrl = (tail, since) => `/ac/${encodeURIComponent(tail)}?since=${since}`;
 
 /* ---------- Map ---------- */
 function makeMap(el, center = DEMO_ORIGIN, zoom = 10) {
@@ -484,7 +499,8 @@ function viewFly() {
   const p = profile();
   const a = store.get('active');
   const save = () => store.set('active', a);
-  const live = { fix: null, trk: null, gpsErr: null, hiddenAt: 0, gap: false };
+  const live = { fix: null, trk: null, gpsErr: null, hiddenAt: 0, gap: false, adsb: null, apiOk: null };
+  const useGps = p.demo || p.gps !== false;
 
   app.innerHTML = `
     <div class="map-screen">
@@ -504,7 +520,7 @@ function viewFly() {
           <div class="stat"><small>Trk</small><b id="s-trk">—</b></div>
           <div class="stat"><small>Dist</small><b id="s-dist">—</b></div>
         </div>
-        <div class="panel-foot"><span id="gps">Finding GPS…</span><span id="sync"></span></div>
+        <div class="sources"><span class="src" id="src-adsb"></span><span class="src" id="src-gps"></span></div>
         <div id="banner"></div>
         <div class="btn-row">
           <button class="btn" id="share">${I.share}Share live link</button>
@@ -520,6 +536,12 @@ function viewFly() {
   let marker = null;
   let follow = true;
   let centered = !!last;
+  const placeMarker = (ll, trk) => {
+    if (!marker) marker = L.marker(ll, { icon: planeIcon(a.color, trk, true), interactive: false, zIndexOffset: 1000 }).addTo(map);
+    else { marker.setLatLng(ll); marker.setIcon(planeIcon(a.color, trk, true)); }
+    if (!centered) { map.setView(ll, 13); centered = true; }
+    else if (follow) map.panTo(ll, { animate: true });
+  };
 
   map.on('dragstart', () => { follow = false; $('#follow').classList.remove('is-on'); });
   $('#follow').onclick = () => {
@@ -565,10 +587,22 @@ function viewFly() {
       if (a.track.length === 1) flush(); // watchers see the plane right away
     }
 
-    if (!marker) marker = L.marker(ll, { icon: planeIcon(a.color, live.trk, true), interactive: false, zIndexOffset: 1000 }).addTo(map);
-    else { marker.setLatLng(ll); marker.setIcon(planeIcon(a.color, live.trk, true)); }
-    if (!centered) { map.setView(ll, 13); centered = true; }
-    else if (follow) map.panTo(ll, { animate: true });
+    placeMarker(ll, live.trk);
+    paint();
+  }
+
+  // Transponder (ADS-B) status from the server; also moves the marker when phone GPS is off or quiet.
+  async function pollAdsb() {
+    const r = await apiGet(adsbUrl(a.tail, a.start));
+    live.apiOk = !!r;
+    live.adsb = r?.ac && r.ac.t >= a.start - 120 ? r.ac : null;
+    const ad = live.adsb;
+    if (ad && now() - ad.t < ADSB_FRESH && (!live.fix || Date.now() - live.fix.ms > 30000)) {
+      if (live.lastAd && ad.t > live.lastAd.t && !ad.ground) a.dist += nmBetween([live.lastAd.lat, live.lastAd.lon], [ad.lat, ad.lon]);
+      live.lastAd = ad;
+      save();
+      placeMarker([ad.lat, ad.lon], ad.trk);
+    }
     paint();
   }
 
@@ -588,6 +622,7 @@ function viewFly() {
     const end = now();
     const dur = end - a.start;
     outbox.add({ topic: dataTopic(p.channel), body: { k: 'e', f: a.fid, t: end } });
+    apiPost('/track/end', { tail: a.tail });
     outbox.add({ alert: {
       topic: alertTopic(p.channel),
       title: `${p.name} has landed`,
@@ -605,50 +640,72 @@ function viewFly() {
   }
 
   function paint() {
-    const f = live.fix;
+    const f = live.fix && Date.now() - live.fix.ms < 30000 ? live.fix : null;
+    const ad = live.adsb && now() - live.adsb.t < ADSB_FRESH ? live.adsb : null;
+    const alt = f?.alt ?? ad?.alt, gs = f?.gs ?? ad?.gs, trk = live.trk ?? ad?.trk;
     $('#elapsed').textContent = fmtDur(now() - a.start);
-    $('#s-alt').innerHTML = f?.alt != null ? `${Math.round(f.alt).toLocaleString()}<u>ft</u>` : '—';
-    $('#s-gs').innerHTML = f?.gs != null ? `${Math.round(f.gs)}<u>kt</u>` : '—';
-    $('#s-trk').innerHTML = live.trk != null ? `${fmtHdg(live.trk)}°` : '—';
+    $('#s-alt').innerHTML = !f && ad?.ground ? 'GND' : alt != null ? `${Math.round(alt).toLocaleString()}<u>ft</u>` : '—';
+    $('#s-gs').innerHTML = gs != null ? `${Math.round(gs)}<u>kt</u>` : '—';
+    $('#s-trk').innerHTML = trk != null ? `${fmtHdg(trk)}°` : '—';
     $('#s-dist').innerHTML = `${a.dist.toFixed(a.dist < 10 ? 1 : 0)}<u>nm</u>`;
 
     const pending = outbox.pending() + a.buf.length;
+    const phoneOk = f && outbox.ok;
+    const state = ad || phoneOk ? 'live' : f || live.adsb ? 'stale' : 'idle';
     const st = $('#st');
-    const state = !f ? 'idle' : outbox.ok ? 'live' : 'stale';
     st.className = `status ${state}`;
-    st.innerHTML = `<i></i>${{ idle: 'GPS', live: 'Live', stale: 'No signal' }[state]}`;
-    $('#gps').textContent = live.gpsErr === 'denied' ? 'Location blocked'
-      : !f ? 'Finding GPS…'
-      : p.demo ? 'Demo mode · simulated GPS'
-      : `GPS ±${Math.round(f.acc)} m`;
-    $('#sync').textContent = !outbox.ok ? `${pending} pts queued` : outbox.lastOk ? `Sent ${ago(outbox.lastOk)}` : '';
+    st.innerHTML = `<i></i>${{ idle: 'Starting', live: 'Live', stale: 'No signal' }[state]}`;
+
+    const chip = (el, cls, text) => { el.className = `src ${cls}`; el.innerHTML = `<i></i>${text}`; };
+    chip($('#src-adsb'), ad ? 'on' : live.adsb ? 'warn' : '',
+      live.apiOk === false ? 'Transponder: unavailable'
+        : ad ? `Transponder · ${ago(ad.t)}`
+        : live.adsb ? `Transponder · last ${ago(live.adsb.t)}`
+        : live.apiOk == null ? 'Transponder · checking…' : 'Transponder · not seen yet');
+    chip($('#src-gps'), !useGps ? '' : phoneOk ? 'on' : f || live.fix ? 'warn' : '',
+      !useGps ? 'Phone GPS · off'
+        : live.gpsErr === 'denied' ? 'Phone GPS · blocked'
+        : !live.fix ? 'Phone GPS · finding…'
+        : !outbox.ok ? `Phone GPS · ${pending} queued`
+        : p.demo ? 'Phone GPS · demo'
+        : `Phone GPS · ±${Math.round(live.fix.acc)} m`);
 
     let banner = '';
-    if (live.gpsErr === 'denied') banner = `<div class="banner">${I.alert}<span>Location is blocked for this site. Allow location access in your phone’s settings, then reopen Contrail.</span></div>`;
+    if (useGps && live.gpsErr === 'denied') banner = `<div class="banner">${I.alert}<span>Location is blocked for this site. Allow location access in your phone’s settings, then reopen Contrail.</span></div>`;
+    else if (ad) banner = now() - a.start < 600 ? `<div class="banner info">${I.check}<span>Your transponder is being tracked. You can lock your phone and it’ll keep working.</span></div>` : '';
     else if (live.gpsErr === 'unsupported') banner = `<div class="banner">${I.alert}<span>This browser can’t share location.</span></div>`;
     else if (live.gap) banner = `<div class="banner">${I.alert}<span>Tracking paused while Contrail was in the background. Keep it open with the screen on.</span></div>`;
     else if (!outbox.ok) banner = `<div class="banner">${I.alert}<span>No data connection. Points are saved and will send when you’re back in coverage.</span></div>`;
-    else if (now() - a.start < 90) banner = `<div class="banner info">${I.alert}<span>Keep Contrail open with the screen on. Phones pause web tracking when locked.</span></div>`;
+    else if (useGps && now() - a.start < 600) banner = `<div class="banner info">${I.alert}<span>Transponder not picked up yet (normal on the ground). Keep Contrail open with the screen on until it is, so phone GPS can cover.</span></div>`;
     const b = $('#banner');
     if (b.innerHTML !== banner) b.innerHTML = banner;
   }
 
   const onVis = () => {
     if (document.visibilityState === 'hidden') { live.hiddenAt = Date.now(); return; }
-    if (live.hiddenAt && Date.now() - live.hiddenAt > 30000) live.gap = true;
-    keepAwake();
+    if (useGps && live.hiddenAt && Date.now() - live.hiddenAt > 30000) live.gap = true;
+    if (useGps) keepAwake();
+    pollAdsb();
     flush();
   };
   document.addEventListener('visibilitychange', onVis);
   cleanup.push(() => document.removeEventListener('visibilitychange', onVis));
 
-  cleanup.push(p.demo ? startSim(onFix, a.start) : startGps(onFix, onGpsErr));
-  keepAwake();
-  cleanup.push(() => { wakeLock?.release(); wakeLock = null; });
+  if (useGps) {
+    cleanup.push(p.demo ? startSim(onFix, a.start) : startGps(onFix, onGpsErr));
+    keepAwake();
+    cleanup.push(() => { wakeLock?.release(); wakeLock = null; });
+  }
+
+  // Ask the server to follow this tail; repeat in case it restarted (free hosting sleeps).
+  apiPost('/track', { tail: a.tail });
+  pollAdsb();
+  const register = setInterval(() => apiPost('/track', { tail: a.tail }), 5 * 60 * 1000);
+  const adsbTimer = setInterval(pollAdsb, 10000);
 
   const flushTimer = setInterval(flush, (p.interval || 30) * 1000);
   const clock = setInterval(paint, 1000);
-  cleanup.push(() => { clearInterval(flushTimer); clearInterval(clock); });
+  cleanup.push(() => { clearInterval(flushTimer); clearInterval(clock); clearInterval(register); clearInterval(adsbTimer); });
 
   if (!a.announced) {
     outbox.add({ topic: dataTopic(p.channel), body: { k: 's', f: a.fid, n: p.name, tail: a.tail, type: a.type, c: a.color, t: a.start, iv: p.interval || 30 } });
@@ -674,6 +731,7 @@ function viewTrack(ch, nameHint) {
   let fitted = false;
   let follow = true;
   let lastHtml = '';
+  let apiOk = null;
 
   app.innerHTML = `
     <div class="map-screen">
@@ -702,7 +760,7 @@ function viewTrack(ch, nameHint) {
     if (pt) map.setView([pt[1], pt[2]], Math.max(map.getZoom(), 12));
   };
 
-  const flight = (fid) => (flights[fid] ||= { fid, pts: [], start: 0, end: 0, seen: 0 });
+  const flight = (fid) => (flights[fid] ||= { fid, pts: [], adsb: [], start: 0, end: 0, seen: 0, v: 0 });
   function ingest(d) {
     if (!d || !d.f) return;
     const f = flight(d.f);
@@ -714,20 +772,58 @@ function viewTrack(ch, nameHint) {
     }
     const lastPt = f.pts[f.pts.length - 1];
     f.seen = Math.max(f.seen, f.start, f.end, lastPt ? lastPt[0] : 0);
+    f.v++;
   }
   const latest = () => Object.values(flights).filter((f) => f.start || f.pts.length).sort((x, y) => y.seen - x.seen)[0];
 
+  // One track from both sources: transponder points, plus phone points only where the transponder has a gap.
+  // Transponder points carry a 7th element 'a' so the panel can say where the position came from.
+  function track(f) {
+    if (f.mv === f.v) return f.merged;
+    const ad = f.adsb.filter((q) => q[0] >= f.start - 60 && (!f.end || q[0] <= f.end + 60));
+    const ts = ad.map((q) => q[0]);
+    const gap = (t) => {
+      let lo = 0, hi = ts.length - 1;
+      while (lo < hi) { const m = (lo + hi) >> 1; if (ts[m] < t) lo = m + 1; else hi = m; }
+      return Math.min(Math.abs(ts[lo] - t), lo ? Math.abs(ts[lo - 1] - t) : Infinity);
+    };
+    const phone = ts.length ? f.pts.filter((q) => gap(q[0]) > 30) : f.pts;
+    f.merged = [...ad.map((q) => [...q.slice(0, 6), 'a']), ...phone].sort((x, y) => x[0] - y[0]);
+    f.mv = f.v;
+    return f.merged;
+  }
+  const lastSeen = (f) => Math.max(f.seen, f.adsb.length ? f.adsb[f.adsb.length - 1][0] : 0);
+
   function statusOf(f) {
     if (f.end) return 'landed';
+    const lastA = f.adsb.length ? f.adsb[f.adsb.length - 1][0] : 0;
+    if (now() - lastA < ADSB_FRESH) return 'live';
     return now() - f.seen > (f.iv || 30) * 2.5 + 20 ? 'stale' : 'live';
+  }
+
+  // Pull transponder data for the current flight from the server.
+  async function pollAdsb() {
+    const f = latest();
+    if (!f || !f.tail || !f.start || now() - f.start > 8 * 3600) return;
+    if (f.end && f.adsbDone) return;
+    const lastA = f.adsb[f.adsb.length - 1];
+    const r = await apiGet(adsbUrl(f.tail, lastA ? lastA[0] : f.start - 60));
+    apiOk = !!r;
+    if (!r) return;
+    for (const q of r.track || []) if (!f.adsb.length || q[0] > f.adsb[f.adsb.length - 1][0]) f.adsb.push(q);
+    f.ac = r.ac;
+    if (f.end) f.adsbDone = true;
+    f.v++;
+    schedule();
   }
 
   function drawMap() {
     const f = latest();
-    if (!f || !f.pts.length) return;
+    const pts = f ? track(f) : [];
+    if (!pts.length) return;
     const color = f.color || COLORS[0];
-    const lls = f.pts.map((q) => [q[1], q[2]]);
-    const lastPt = f.pts[f.pts.length - 1];
+    const lls = pts.map((q) => [q[1], q[2]]);
+    const lastPt = pts[pts.length - 1];
     const here = [lastPt[1], lastPt[2]];
     const st = statusOf(f);
     trail.setStyle({ color });
@@ -761,15 +857,18 @@ function viewTrack(ch, nameHint) {
         <a class="btn btn-primary btn-block" style="margin-top:14px" href="#/follow/${esc(ch)}/${encodeURIComponent(nameHint)}">${I.bell}Get flight alerts</a>`;
     } else {
       const st = statusOf(f);
-      const pt = f.pts[f.pts.length - 1];
+      const pts = track(f);
+      const pt = pts[pts.length - 1];
+      const seen = lastSeen(f);
       const label = { live: 'Live', stale: 'Signal lost', landed: 'Landed' }[st];
-      const dist = f.pts.reduce((s, q, i) => (i ? s + nmBetween([f.pts[i - 1][1], f.pts[i - 1][2]], [q[1], q[2]]) : 0), 0);
-      const dur = (f.end || (st === 'live' ? now() : f.seen)) - (f.start || f.pts[0]?.[0] || f.seen);
+      const dist = pts.reduce((s, q, i) => (i ? s + nmBetween([pts[i - 1][1], pts[i - 1][2]], [q[1], q[2]]) : 0), 0);
+      const dur = (f.end || (st === 'live' ? now() : seen)) - (f.start || pts[0]?.[0] || seen);
+      const via = pt ? (pt[6] === 'a' ? ' · via transponder' : ' · via phone GPS') : '';
       const foot = st === 'landed'
         ? `Landed at ${fmtTime(f.end)} · ${fmtHrs(dur)}`
         : st === 'stale'
-          ? `Last update ${ago(f.seen)} — likely out of cell coverage`
-          : `Updated ${ago(f.seen)}`;
+          ? `Last position ${ago(seen)}${via}`
+          : pt ? `Updated ${ago(pt[0])}${via}` : 'Started — waiting for first position';
       html = `
         <div class="panel-head">
           <div class="avatar" style="--c:${f.color || COLORS[0]}">${esc((f.name || nameHint || '?')[0].toUpperCase())}</div>
@@ -777,7 +876,7 @@ function viewTrack(ch, nameHint) {
           <span class="status ${st}"><i></i>${label}</span>
         </div>
         <div class="stats">
-          <div class="stat"><small>Alt</small><b>${pt?.[3] != null ? Math.round(pt[3]).toLocaleString() + '<u>ft</u>' : '—'}</b></div>
+          <div class="stat"><small>Alt</small><b>${pt?.[6] === 'a' && pt[3] === 0 ? 'GND' : pt?.[3] != null ? Math.round(pt[3]).toLocaleString() + '<u>ft</u>' : '—'}</b></div>
           <div class="stat"><small>Speed</small><b>${pt?.[4] != null ? pt[4] + '<u>kt</u>' : '—'}</b></div>
           <div class="stat"><small>Hdg</small><b>${pt?.[5] != null ? fmtHdg(pt[5]) + '°' : '—'}</b></div>
           <div class="stat"><small>Time</small><b>${fmtDur(dur).replace(/:\d\d$/, (m) => (dur >= 3600 ? '' : m))}</b></div>
@@ -806,7 +905,15 @@ function viewTrack(ch, nameHint) {
     schedule();
   };
   const tick = setInterval(() => { renderPanel(); }, 1000);
-  cleanup.push(() => { es.close(); clearInterval(tick); clearTimeout(pending); });
+  let adsbBusy = false;
+  const adsbTick = async () => {
+    if (adsbBusy) return;
+    adsbBusy = true;
+    try { await pollAdsb(); } finally { adsbBusy = false; }
+  };
+  const adsbTimer = setInterval(adsbTick, 5000);
+  const adsbFirst = setTimeout(adsbTick, 1500); // after the ntfy backlog tells us the tail number
+  cleanup.push(() => { es.close(); clearInterval(tick); clearInterval(adsbTimer); clearTimeout(adsbFirst); clearTimeout(pending); });
   renderPanel();
 }
 
@@ -870,6 +977,7 @@ function viewSettings() {
         </div>
       </section>
       <section class="list">
+        ${row('Phone GPS backup', 'Your transponder is tracked automatically. Also sending phone GPS fills gaps where receivers can’t see you (low in the pattern), but needs Contrail open with the screen on.', `<button class="switch ${p.gps !== false ? 'is-on' : ''}" id="gps" role="switch" aria-checked="${p.gps !== false}" aria-label="Phone GPS backup"></button>`)}
         ${row('Demo mode', 'Simulate a flight near Martin State (KMTN) instead of using GPS. Great for showing your people how it works.', `<button class="switch ${p.demo ? 'is-on' : ''}" id="demo" role="switch" aria-checked="${!!p.demo}" aria-label="Demo mode"></button>`)}
       </section>
       <section class="card watch-card">
@@ -896,6 +1004,13 @@ function viewSettings() {
     e.currentTarget.classList.toggle('is-on', on);
     e.currentTarget.setAttribute('aria-checked', on);
     toast(on ? 'Demo mode on' : 'Demo mode off');
+  };
+  $('#gps').onclick = (e) => {
+    const on = profile().gps === false;
+    saveProfile({ ...profile(), gps: on });
+    e.currentTarget.classList.toggle('is-on', on);
+    e.currentTarget.setAttribute('aria-checked', on);
+    toast(on ? 'Phone GPS backup on' : 'Transponder only');
   };
   $('#copy').onclick = () => copy(followUrl(profile()), 'Invite link copied');
   $('#reset').onclick = async () => {
