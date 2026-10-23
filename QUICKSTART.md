@@ -1,6 +1,6 @@
-# Quick Start: Testing the Native App
+# Quick Start: Testing the Native iOS App
 
-## For Ryan: Try It Out in 15 Minutes
+## For Ryan: Try It Out in 20 Minutes
 
 ### Step 1: Set Up Render Database (5 min)
 
@@ -22,25 +22,44 @@
 9. Wait for deploy to complete (~2 min)
 10. Check logs - you should see "✓ Migration complete"
 
-### Step 2: Set Up Firebase (5 min)
+### Step 2: Get APNs Key from Apple (10 min)
 
-1. Go to https://console.firebase.google.com/
-2. Click **Create a project** (or use existing)
-   - **Name**: Contrail
-   - Disable Google Analytics (optional)
-3. Once created, click the gear icon → **Project settings**
-4. Go to **Cloud Messaging** tab
-5. Scroll down to **Cloud Messaging API (Legacy)**
-6. Copy the **Server key** (starts with `AAAA...`)
-7. Back in Render, go to your `contrail` service → **Environment**
-8. Add new variable:
-   - **Key**: `FCM_SERVER_KEY`
-   - **Value**: (paste the server key)
-9. Click **Save Changes**
+1. Enroll in Apple Developer Program if you haven't: https://developer.apple.com/programs/ ($99/year)
+2. Go to https://developer.apple.com/account
+3. **Certificates, Identifiers & Profiles** → **Keys**
+4. Click **+** to create a new key
+5. **Name**: Contrail Push Key
+6. Check **Apple Push Notifications service (APNs)**
+7. Click **Continue** → **Register**
+8. **Download** the `.p8` file (you can only do this once!)
+9. Note the **Key ID** (10 characters, shown on download page)
+10. Note your **Team ID** (top right, or Account → Membership, also 10 characters)
 
-### Step 3: Test on Your Phone (5 min)
+### Step 3: Configure Render Environment (5 min)
 
-**On your Mac (for iOS):**
+Go to Render → contrail service → **Environment** and add:
+
+```bash
+APNS_KEY_ID=ABC123XYZ          # Your Key ID from Apple
+APNS_TEAM_ID=DEF456UVW         # Your Team ID from Apple
+APNS_BUNDLE_ID=com.contrail.app
+APNS_ENV=sandbox               # Use 'sandbox' for dev, 'production' for TestFlight/App Store
+```
+
+For `APNS_KEY`, open the `.p8` file in a text editor, copy the entire contents, and paste:
+
+```bash
+APNS_KEY=-----BEGIN PRIVATE KEY-----
+MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQg...
+(entire key)
+-----END PRIVATE KEY-----
+```
+
+Click **Save Changes**. Wait for deploy to complete.
+
+### Step 4: Test on Your iPhone (10 min)
+
+**On your Mac:**
 ```bash
 # Clone the repo (if you haven't already)
 git clone https://github.com/ryanjbusker/Tracking-App.git
@@ -63,19 +82,20 @@ npx cap open ios
 ```
 
 In Xcode:
-1. Connect your iPhone via cable
-2. Select your iPhone as the target (top toolbar)
-3. Click the Play button (or Cmd+R)
-4. App installs and opens on your phone
-5. Create your profile, add an aircraft
-
-**On another device or browser:**
-1. Open https://contrail-xnd3.onrender.com
-2. Use the invite link from Settings
+1. Select **App** target (not Pods or AppExtension)
+2. **Signing & Capabilities** tab:
+   - **Team**: Select your Apple Developer team
+   - Add capability: **Push Notifications** (click + Capability)
+   - Add capability: **Background Modes** → check **Remote notifications**
+3. Connect your iPhone via cable
+4. Select your iPhone as the target (top toolbar)
+5. Click the Play button (or Cmd+R)
+6. App installs and opens on your phone
+7. Create your profile, add an aircraft
 
 **Test push:**
 ```bash
-# Get your channel ID from Settings
+# Get your channel ID from Settings in the app
 # Then test:
 curl -X POST https://contrail-xnd3.onrender.com/api/push/test \
   -H "Content-Type: application/json" \
@@ -84,17 +104,25 @@ curl -X POST https://contrail-xnd3.onrender.com/api/push/test \
 
 You should receive a notification: "Push notifications are working!"
 
+**Test follow flow:**
+1. Device A (your iPhone with the app): Settings → copy invite link
+2. Device B (another iPhone or open link in Safari): Open link → should see "Follow" button
+3. Tap Follow (in native app) or use ntfy.sh (on web)
+4. Device A: Start a flight
+5. Device B: Should receive push notification
+6. Tap notification → opens to live map
+
 ## What You'll See
 
 ### In the Native App:
 - When you open an invite link, you see a big "Follow [Name]" button
 - Tap it → "Following!" confirmation
-- No need to copy/paste topic names or install ntfy
+- No need to install ntfy
 
 ### When Testing:
 1. **Device A** (iPhone with app): Start a flight
 2. **Device B** (any device that followed): Gets native push notification
-3. Tap the notification → opens directly to the live map in the app
+3. Tap the notification → opens directly to the live map
 4. **Device A**: End flight
 5. **Device B**: Gets "landed" notification
 
@@ -114,28 +142,21 @@ Contrail on :3000
 - Make sure PostgreSQL instance is running
 
 **"Push not working":**
-- Check FCM_SERVER_KEY is set
+- Check all APNs environment variables are set (5 variables)
+- Verify APNS_KEY includes the BEGIN and END lines
 - Make sure you're testing on a real device (not simulator)
-- Look at Render logs for FCM errors
+- Check APNS_ENV matches your build (sandbox for dev)
+- Look at Render logs for APNs errors
 
 **"Can't build iOS app":**
 - Need Xcode installed (Mac only)
 - Need to connect a real iPhone (simulators don't support push)
 - If signing errors, select your Apple ID in Xcode project settings
-
-**"Can't test - don't have a Mac":**
-- Try Android instead:
-  ```bash
-  npx cap add android
-  npx cap sync android
-  npx cap open android
-  ```
-- Or just test with two browsers for now (web PWA)
+- Make sure Push Notifications capability is enabled
 
 ## Next: Full App Store Submission
 
 Once you've tested and it works, follow the full guide in README.md:
-- Enroll in Apple Developer Program
 - Create App Store Connect listing
 - Configure bundle ID and signing
 - Build for TestFlight

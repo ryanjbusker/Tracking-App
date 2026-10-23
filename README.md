@@ -2,7 +2,7 @@
 
 Live flight tracking for training flights. Pick your aircraft, tap **Start flight**, and the people you've invited get a push notification with a link to a live map. They get another when you land.
 
-**NEW in v2.0**: Native iOS and Android apps with native push notifications! 🎉
+**NEW in v2.0**: Native iOS app with native push notifications! 🎉
 
 ## How it works
 
@@ -56,40 +56,24 @@ Settings → **Demo mode** simulates a flight circling near Martin State (KMTN).
 
 ---
 
-## 🚀 Ship Checklist: Native Mobile Apps
+## 🚀 Ship Checklist: Native iOS App
 
-This checklist covers everything Ryan needs to do himself to publish Contrail to the App Store and Google Play.
+This checklist covers everything Ryan needs to publish Contrail to the App Store.
 
 ### Prerequisites
 
 ✅ **Already done in this PR:**
-- ✓ Capacitor setup with iOS and Android projects
+- ✓ Capacitor setup with iOS project
 - ✓ PostgreSQL database schema (tables for device tokens, followers, flight events)
 - ✓ Server API endpoints for device registration, following, and push notifications
+- ✓ Direct APNs integration (no Firebase)
 - ✓ Native push notification integration in the app
 - ✓ Tests for all server endpoints
 - ✓ GitHub Actions CI
 
 ❗ **You need to complete:**
 
-### 1. Set Up Firebase Cloud Messaging (FCM)
-
-FCM provides unified push notifications for both iOS and Android.
-
-1. Go to [Firebase Console](https://console.firebase.google.com/)
-2. Create a new project (or use existing): **Contrail**
-3. In Project Settings → Cloud Messaging:
-   - Copy the **Server Key** (Legacy)
-   - This is your `FCM_SERVER_KEY` for Render
-4. For iOS, also upload your APNs certificate/key (see iOS setup below)
-
-**📝 Add to Render:**
-```bash
-# In Render Dashboard → contrail service → Environment
-FCM_SERVER_KEY=AAAA...your-key-here
-```
-
-### 2. Set Up Render PostgreSQL Database
+### 1. Set Up Render PostgreSQL Database
 
 1. In [Render Dashboard](https://dashboard.render.com):
    - Click **New +** → **PostgreSQL**
@@ -106,283 +90,317 @@ FCM_SERVER_KEY=AAAA...your-key-here
 
 4. Run the migration:
    ```bash
-   # SSH into your Render service or run locally with DATABASE_URL set
-   npm run db:migrate
+   # The migration runs automatically on next deploy
+   # Or run manually via SSH: npm run db:migrate
    ```
-   
-   Or trigger a deploy after setting `DATABASE_URL` — the migration runs automatically on startup (add to `buildCommand`).
 
-### 3. iOS App Store Setup
+### 2. Apple Developer Program
 
-#### a. Apple Developer Program
 1. Enroll in [Apple Developer Program](https://developer.apple.com/programs/) ($99/year)
 2. Wait for approval (can take 24-48 hours)
 
-#### b. App Store Connect
+### 3. Create APNs Authentication Key
+
+1. Go to [Apple Developer Portal](https://developer.apple.com/account)
+2. Navigate to **Certificates, Identifiers & Profiles**
+3. Click **Keys** in the left sidebar
+4. Click the **+** button
+5. **Name**: Contrail Push Key
+6. **Enable**: Apple Push Notifications service (APNs)
+7. Click **Continue**, then **Register**
+8. **Download** the `.p8` key file (you can only download it once!)
+9. Note the **Key ID** (shows on the download page)
+10. Note your **Team ID** (top right of the portal, or Account → Membership)
+
+### 4. Configure Render Environment Variables
+
+In Render Dashboard → contrail service → Environment, add:
+
+```bash
+# Database (from step 1)
+DATABASE_URL=postgresql://user:pass@dpg-xxx.oregon-postgres.render.com/contrail_db
+
+# APNs Configuration
+APNS_KEY_ID=ABC123XYZ      # Key ID from Apple (10 characters)
+APNS_TEAM_ID=DEF456UVW     # Team ID from Apple (10 characters)
+APNS_BUNDLE_ID=com.contrail.app
+APNS_ENV=production        # Use 'sandbox' for development, 'production' for TestFlight/App Store
+
+# APNs Key (.p8 file contents - see below for how to set this)
+APNS_KEY=-----BEGIN PRIVATE KEY-----
+MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQg...
+...entire key here...
+-----END PRIVATE KEY-----
+```
+
+**Setting the APNS_KEY value:**
+1. Open the downloaded `.p8` file in a text editor
+2. Copy the entire contents (including `-----BEGIN PRIVATE KEY-----` and `-----END PRIVATE KEY-----`)
+3. Paste into the APNS_KEY environment variable in Render
+
+**Save** and wait for the deployment to complete.
+
+### 5. App Store Connect Setup
+
 1. Log in to [App Store Connect](https://appstoreconnect.apple.com/)
 2. Click **Apps** → **+** → **New App**
    - **Platform**: iOS
    - **Name**: Contrail
    - **Primary Language**: English (U.S.)
-   - **Bundle ID**: Create new → `com.contrail.app` (must match `capacitor.config.json`)
+   - **Bundle ID**: Create new → `com.contrail.app` (must match capacitor.config.json)
    - **SKU**: `contrail-ios-001`
    - **User Access**: Full Access
 3. Fill out app metadata:
-   - **Category**: Navigation or Utilities
-   - **Description**: (copy from landing page)
-   - **Keywords**: flight tracking, ads-b, aviation, student pilot
-   - **Support URL**: Your website or GitHub repo
-   - **Privacy Policy URL**: Create a simple privacy policy (required)
+   - **Category**: Navigation
+   - **Description**: Live flight tracking for student pilots. Your people get notified when you start a flight and can follow along in real time.
+   - **Keywords**: flight tracking, aviation, student pilot, ads-b, flight training
+   - **Support URL**: Your website or this GitHub repo
+   - **Privacy Policy URL**: Create a simple privacy policy (required - see below)
 
-#### c. Configure Bundle ID in Xcode
+**Privacy Policy (simple example):**
+```
+Contrail Privacy Policy
+
+Contrail collects:
+- Your name and aircraft information (stored on your device)
+- Your device push notification token (stored on our server to send you notifications)
+- Flight tracking data (GPS position, altitude, speed when you start a flight)
+
+This data is used only to provide the flight tracking service. We do not sell or share your data with third parties.
+
+Contact: [your email]
+```
+
+Host this somewhere (GitHub Pages, your website, etc.) and link to it.
+
+### 6. Configure Xcode Project
+
 1. Install [Xcode](https://apps.apple.com/app/xcode/id497799835) (Mac required)
-2. Open Capacitor iOS project:
+
+2. Generate iOS project:
+   ```bash
+   cd /path/to/Tracking-App
+   git checkout cursor/native-app-push-notifications-90c8
+   npm install
+   npx cap add ios
+   npx cap sync ios
+   ```
+
+3. Open in Xcode:
    ```bash
    npx cap open ios
    ```
-3. In Xcode:
-   - Select the **Contrail** project in the sidebar
-   - Go to **Signing & Capabilities** tab
+
+4. In Xcode, select the **App** target (not AppExtension or Pods)
+
+5. **Signing & Capabilities** tab:
    - **Team**: Select your Apple Developer team
    - **Bundle Identifier**: `com.contrail.app` (must match App Store Connect)
-   - Enable **Push Notifications** capability (click **+ Capability**)
-   - Enable **Background Modes** → check **Remote notifications**
+   - Xcode will automatically create/update provisioning profiles
 
-#### d. APNs Authentication Key
-1. In [Apple Developer Portal](https://developer.apple.com/account):
-   - Go to **Certificates, Identifiers & Profiles**
-   - **Keys** → **+** → Create a key
-   - **Name**: Contrail Push Key
-   - Enable **Apple Push Notifications service (APNs)**
-   - Download the `.p8` key file (save it securely)
-   - Note the **Key ID** and **Team ID**
+6. Add **Push Notifications** capability:
+   - Click **+ Capability** button
+   - Search for "Push Notifications"
+   - Add it
 
-2. Upload to Firebase Console:
-   - Project Settings → Cloud Messaging → iOS app configuration
-   - Upload the APNs Auth Key (.p8), Key ID, and Team ID
+7. Add **Background Modes** capability (if not already present):
+   - Click **+ Capability**
+   - Search for "Background Modes"
+   - Check **Remote notifications**
 
-#### e. Build and Submit to TestFlight
-1. Update version number in `ios/App/App.xcodeproj`:
-   - **Version**: `2.0.0`
-   - **Build**: `1`
+8. **General** tab:
+   - **Display Name**: Contrail
+   - **Version**: 2.0.0
+   - **Build**: 1
 
-2. Build and archive:
-   ```bash
-   # Sync web assets to iOS
-   npx cap sync ios
-   
-   # Open Xcode
-   npx cap open ios
-   
-   # In Xcode:
-   # 1. Select "Any iOS Device" as target
-   # 2. Product → Archive
-   # 3. Wait for build to complete
-   # 4. Click "Distribute App"
-   # 5. Choose "App Store Connect"
-   # 6. Upload
-   ```
+### 7. Build and Upload to TestFlight
 
-3. Once upload completes:
-   - Go to App Store Connect → TestFlight
-   - Add internal testers (yourself) or external testers
-   - Approve for Beta review (if using external testers)
-   - Install TestFlight app on iPhone and test
+1. In Xcode, select **Any iOS Device (arm64)** as the build target (top toolbar)
 
-#### f. Submit for App Review
-1. In App Store Connect → Contrail → App Store tab:
-   - Add screenshots (see below for how to capture)
-   - Add app icon (1024x1024 PNG)
-   - Set pricing (Free)
-   - Age rating questionnaire
-   - App Review Information (contact details)
-   - Version Release: Manual or Automatic
-2. Click **Submit for Review**
-3. Wait 1-3 days for review
+2. Menu: **Product** → **Archive**
 
-### 4. Google Play Setup
+3. Wait for the build to complete (5-10 minutes first time)
 
-#### a. Google Play Console
-1. Go to [Google Play Console](https://play.google.com/console)
-2. Pay one-time $25 registration fee
-3. Click **Create app**
-   - **App name**: Contrail
-   - **Default language**: English (United States)
-   - **App or game**: App
-   - **Free or paid**: Free
-4. Complete app content questionnaires:
-   - Privacy Policy (required)
-   - Data safety form
-   - Content rating questionnaire (select your region, answer questions)
-   - Target audience and content
-   - News apps declaration (No)
+4. The **Organizer** window opens automatically
 
-#### b. Configure Android App
-1. Update `android/app/build.gradle`:
-   ```gradle
-   android {
-       defaultConfig {
-           applicationId "com.contrail.app"  // Must match Capacitor config
-           versionCode 1
-           versionName "2.0.0"
-       }
-   }
-   ```
+5. Select your archive, click **Distribute App**
 
-2. Add Firebase config:
-   - In Firebase Console, add an Android app
-   - Package name: `com.contrail.app`
-   - Download `google-services.json`
-   - Place in `android/app/` directory
+6. Choose **App Store Connect** → **Upload**
 
-3. Open Android Studio:
-   ```bash
-   npx cap sync android
-   npx cap open android
-   ```
+7. **Distribution Certificate**: Automatic signing
 
-4. Generate signing key:
-   ```bash
-   # On Mac/Linux
-   keytool -genkey -v -keystore contrail-release.keystore \
-     -alias contrail -keyalg RSA -keysize 2048 -validity 10000
-   
-   # Save this file securely! You cannot publish updates without it.
-   ```
+8. Click **Upload**
 
-5. Configure signing in `android/app/build.gradle`:
-   ```gradle
-   android {
-       signingConfigs {
-           release {
-               storeFile file('../../contrail-release.keystore')
-               storePassword 'your-keystore-password'
-               keyAlias 'contrail'
-               keyPassword 'your-key-password'
-           }
-       }
-       buildTypes {
-           release {
-               signingConfig signingConfigs.release
-           }
-       }
-   }
-   ```
+9. Wait for upload to complete (5-10 minutes)
 
-#### c. Build Release APK/Bundle
-1. In Android Studio:
-   - **Build** → **Generate Signed Bundle / APK**
-   - Choose **Android App Bundle** (recommended)
-   - Select the keystore file
-   - Choose **release** build variant
-   - Click **Finish**
+### 8. TestFlight Testing
 
-2. Or via command line:
-   ```bash
-   cd android
-   ./gradlew bundleRelease
-   # Output: android/app/build/outputs/bundle/release/app-release.aab
-   ```
+1. Once upload completes, go to [App Store Connect](https://appstoreconnect.apple.com/)
 
-#### d. Upload to Play Console
-1. In Play Console → Contrail → Production:
-   - **Create new release**
-   - Upload the `.aab` file
-   - Add release notes: "Initial release with native push notifications"
-   - Click **Review release** → **Start rollout to Production**
+2. Your app → **TestFlight** tab
 
-2. Or start with **Internal testing** / **Closed testing** first
+3. The build will say "Processing" for 5-15 minutes (Apple scans it)
 
-3. Wait a few hours for review (usually faster than iOS)
+4. Once it says "Ready to Submit":
+   - Click the build number
+   - Add "What to Test" notes (optional)
+   - Add yourself as an **Internal Tester**
+   - Click **Save**
 
-### 5. App Screenshots
+5. Install **TestFlight** app on your iPhone (from App Store)
 
-#### iOS Screenshots
-Required sizes (at minimum):
-- 6.7" Display (iPhone 14 Pro Max): 1290 x 2796 px
-- 6.5" Display (iPhone 11 Pro Max): 1242 x 2688 px
+6. Open TestFlight, you'll see Contrail
+
+7. Tap **Install**
+
+8. **Test the app**:
+   - Register your device (happens automatically on launch)
+   - Test the follow flow
+   - Test receiving push notifications:
+     ```bash
+     curl -X POST https://contrail-xnd3.onrender.com/api/push/test \
+       -H "Content-Type: application/json" \
+       -d '{"channel": "your-channel-id"}'
+     ```
+
+### 9. Submit for App Review
+
+Once testing is complete:
+
+1. In App Store Connect → Your app → **App Store** tab
+
+2. **App Information**:
+   - Confirm bundle ID, category, etc.
+
+3. **Pricing and Availability**:
+   - **Price**: Free
+   - **Availability**: All countries (or select specific ones)
+
+4. **App Privacy**:
+   - Click **Get Started**
+   - Answer questions:
+     - **Collect data?** Yes
+     - **Location?** Yes (for flight tracking)
+     - **Contact Info?** No
+     - **Identifiers?** Yes (device token for push notifications)
+   - **How is data used?** App Functionality
+   - **Linked to user?** No
+   - Save
+
+5. **Version 2.0.0** → **+** (if not already created)
+
+6. **Screenshots**:
+   - See "Taking Screenshots" section below
+
+7. **App Preview** (optional video): Skip for now
+
+8. **Promotional Text** (optional): Skip
+
+9. **Description**: Copy from above
+
+10. **Keywords**: `flight tracking, aviation, student pilot, ads-b, flight training, live map, transponder`
+
+11. **Support URL**: Link to GitHub or your site
+
+12. **Marketing URL** (optional): Skip
+
+13. **Version**: 2.0.0
+
+14. **Copyright**: 2026 Ryan Busker
+
+15. **Build**: Select the TestFlight build you tested
+
+16. **App Review Information**:
+    - **First Name**: Ryan
+    - **Last Name**: Busker
+    - **Email**: Your email
+    - **Phone**: Your phone
+    - **Demo Account** (if login required): N/A
+
+17. **Notes**:
+    ```
+    Contrail is a flight tracking app for student pilots.
+    To test:
+    1. Create a profile
+    2. Add an aircraft (e.g. N12345)
+    3. Settings → Demo Mode ON
+    4. Start Flight
+    5. View the live map
+    ```
+
+18. **Version Release**: **Manually release this version** (so you control the launch)
+
+19. Click **Add for Review**
+
+20. Click **Submit for Review**
+
+21. Wait 1-3 days for review
+
+### 10. Taking Screenshots
+
+**Required sizes:**
+- 6.7" Display (iPhone 14 Pro Max): 1290 x 2796 px (required)
+- 6.5" Display (iPhone 11 Pro Max): 1242 x 2688 px (optional but recommended)
+
+**Recommended screens:**
+1. Home screen with aircraft list
+2. Flight in progress (live map with plane icon)
+3. Live tracking (watcher view)
+4. Settings screen
+
+**How to capture:**
 
 1. Run app in Xcode Simulator:
    ```bash
    npx cap run ios
    ```
-2. Take screenshots:
+
+2. In Simulator menu: **Device** → Choose iPhone 14 Pro Max
+
+3. Navigate to each screen in the app
+
+4. Take screenshots:
    - **Cmd + S** in Simulator
-   - Or use **Xcode** → **Debug** → **Capture Screenshot**
+   - Or **Simulator menu** → **File** → **Save Screen**
 
-Recommended screens:
-1. Home screen with aircraft list
-2. Live flight map (pilot view)
-3. Live flight tracking (watcher view)
-4. Settings screen
+5. Screenshots save to Desktop
 
-#### Android Screenshots
-Required: At least 2 screenshots, up to 8
+6. Upload to App Store Connect
 
-- Phone: 1080 x 1920 px or 1080 x 2340 px
+### 11. After Approval
 
-1. Run app in Android Emulator:
-   ```bash
-   npx cap run android
-   ```
-2. Take screenshots:
-   - **Camera icon** in emulator toolbar
-   - Or use Android Studio device screenshot tool
+1. You'll receive an email: "Contrail is Ready for Sale"
 
-### 6. Testing Push Notifications
+2. In App Store Connect, click **Release This Version**
 
-#### Test on Device (Development)
-1. Run the app on a physical device (push doesn't work in simulators)
-   ```bash
-   # iOS
-   npx cap run ios --target="Your iPhone"
-   
-   # Android
-   npx cap run android --target="your-device-id"
-   ```
+3. The app goes live within 24 hours
 
-2. Register your device (happens automatically on app launch)
+4. Share the link: `https://apps.apple.com/app/contrail/id[your-app-id]`
 
-3. Test endpoint:
-   ```bash
-   curl -X POST https://contrail-xnd3.onrender.com/api/push/test \
-     -H "Content-Type: application/json" \
-     -d '{"channel": "your-channel-id"}'
-   ```
+### 12. Updates
 
-4. You should receive a "Push notifications are working!" notification
+For future updates:
 
-#### Test Full Flow
-1. Install app on two devices (or one device + web browser)
-2. Device A: Create profile, add aircraft
-3. Device B: Open invite link from Device A → tap **Follow**
-4. Device A: Start a flight
-5. Device B should receive push notification
-6. Device A: End flight
-7. Device B should receive landed notification
-
-### 7. Post-Launch
-
-#### Update App
-1. Increment version numbers:
-   - `package.json`: `"version": "2.1.0"`
-   - iOS: In Xcode, bump **Version** or **Build** number
-   - Android: In `build.gradle`, increment `versionCode` and `versionName`
-
-2. Build and upload to App Store Connect / Play Console
-
-3. Push will auto-deploy from GitHub to Render
-
-#### Monitor
-- Check Render logs for server errors
-- Check Play Console / App Store Connect for crash reports
-- Monitor database size in Render dashboard
-
-#### Support
-- Add support email in app and store listings
-- Respond to reviews in App Store / Play Store
+1. Make changes to code
+2. Increment version in Xcode:
+   - **Version**: 2.1.0 (or 2.0.1 for bug fixes)
+   - **Build**: 2 (increment for each TestFlight upload)
+3. **Product** → **Archive**
+4. Upload to TestFlight
+5. Test
+6. Submit new version for review
 
 ---
+
+## Future: Android Support
+
+Android support was removed to simplify the initial launch. To add it later:
+
+1. Set up Firebase Cloud Messaging (FCM)
+2. Add FCM server key to Render environment
+3. Modify server to support FCM tokens in addition to APNs
+4. Add Android platform: `npx cap add android`
+5. Follow Google Play setup guide
 
 ## Development
 
@@ -400,7 +418,11 @@ createdb contrail_dev
 
 # Set environment variables
 export DATABASE_URL=postgresql://localhost/contrail_dev
-export FCM_SERVER_KEY=your-test-key
+export APNS_KEY_ID=ABC123XYZ
+export APNS_TEAM_ID=DEF456UVW
+export APNS_BUNDLE_ID=com.contrail.app
+export APNS_KEY="$(cat /path/to/AuthKey_ABC123XYZ.p8)"
+export APNS_ENV=sandbox
 
 # Run migrations
 npm run db:migrate
@@ -422,27 +444,24 @@ DATABASE_URL=postgresql://localhost/contrail_dev npm test
 ### Capacitor Commands
 
 ```bash
-# Add platforms (already done)
+# Add iOS platform (first time only)
 npx cap add ios
-npx cap add android
 
-# Sync web assets to native projects
+# Sync web assets to iOS project
 npx cap sync
 
-# Open in native IDE
+# Open in Xcode
 npx cap open ios
-npx cap open android
 
 # Run on device
 npx cap run ios
-npx cap run android
 ```
 
 ### Update Capacitor Dependencies
 
 ```bash
 npm install @capacitor/core@latest @capacitor/cli@latest
-npm install @capacitor/ios@latest @capacitor/android@latest
+npm install @capacitor/ios@latest
 npx cap sync
 ```
 
@@ -455,9 +474,9 @@ npx cap sync
 - Uses ntfy.sh for web push notifications
 - Served from `index.html`, `app.js`, `styles.css`
 
-### Native App (iOS/Android)
+### Native App (iOS)
 - Wraps the web app using Capacitor
-- Replaces ntfy.sh with native Firebase Cloud Messaging
+- Replaces ntfy.sh with native Apple Push Notifications (APNs)
 - Device registration happens automatically on app launch
 - Push notifications open directly into the app's map view
 
@@ -468,7 +487,7 @@ npx cap sync
   - `followers`: Pilot → follower relationships
   - `flight_events`: Flight start/end log (debugging)
 - ADS-B polling (adsb.lol, adsb.fi)
-- Firebase Cloud Messaging integration
+- Direct APNs integration via HTTP/2 (token-based auth with .p8 key)
 
 ### Database Schema
 
@@ -477,7 +496,7 @@ CREATE TABLE devices (
   id SERIAL PRIMARY KEY,
   channel VARCHAR(32) NOT NULL,
   token TEXT NOT NULL UNIQUE,
-  platform VARCHAR(10) NOT NULL CHECK (platform IN ('ios', 'android', 'web')),
+  platform VARCHAR(10) NOT NULL CHECK (platform = 'ios'),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   last_seen TIMESTAMPTZ DEFAULT NOW()
 );
@@ -508,21 +527,19 @@ CREATE TABLE flight_events (
 ### Push Notifications Not Working
 
 **iOS:**
-1. Check that APNs key is uploaded to Firebase
+1. Check that APNs environment variables are set correctly in Render:
+   - `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID`, `APNS_KEY`, `APNS_ENV`
 2. Verify Bundle ID matches everywhere (`com.contrail.app`)
 3. Ensure Push Notifications capability is enabled in Xcode
 4. Check device token is being registered: look for console log "Push token: ..."
-5. Test on a real device (not simulator)
-
-**Android:**
-1. Verify `google-services.json` is in `android/app/`
-2. Check package name matches (`com.contrail.app`)
-3. Test on a real device (emulator should work but can be flaky)
+5. Test on a real device (push doesn't work in simulator)
+6. Check APNS_ENV: use `sandbox` for development builds, `production` for TestFlight/App Store
 
 **Server:**
-1. Check `FCM_SERVER_KEY` is set in Render environment
+1. Check all APNs environment variables are set in Render
 2. Check database is accessible (`DATABASE_URL` set)
-3. Look at Render logs for FCM errors
+3. Look at Render logs for APNs errors (410 = invalid token)
+4. Verify the .p8 key contents are correctly pasted (including BEGIN/END lines)
 
 ### Database Connection Issues
 - Ensure `DATABASE_URL` is the **Internal** URL from Render PostgreSQL (not External)
@@ -534,12 +551,8 @@ CREATE TABLE flight_events (
 **iOS:**
 - Update CocoaPods: `cd ios && pod install`
 - Clean build folder: Xcode → Product → Clean Build Folder
-- Check Xcode version (need latest for latest iOS SDK)
-
-**Android:**
-- Clean: `cd android && ./gradlew clean`
-- Invalidate caches: Android Studio → File → Invalidate Caches
-- Check Java version: `java -version` (need Java 11+)
+- Check Xcode version (need Xcode 14+ for iOS 16+ SDK)
+- Verify you're building for a real device or Generic iOS Device (not simulator)
 
 ---
 

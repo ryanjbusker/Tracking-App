@@ -75,7 +75,7 @@ describe('Device Registration API', () => {
     if (!process.env.DATABASE_URL) {
       const res = await request('POST', '/api/device/register', {
         channel: 'testchannel123',
-        token: 'test-token-456',
+        token: 'test-apns-token-456',
         platform: 'ios',
       });
       assert.strictEqual(res.status, 503);
@@ -84,7 +84,7 @@ describe('Device Registration API', () => {
     
     const res = await request('POST', '/api/device/register', {
       channel: 'testchannel123',
-      token: 'test-token-456',
+      token: 'test-apns-token-456',
       platform: 'ios',
     });
     assert.strictEqual(res.status, 200);
@@ -98,6 +98,18 @@ describe('Device Registration API', () => {
       platform: 'ios',
     });
     assert.ok(res.status === 400 || res.status === 503);
+  });
+
+  test('POST /api/device/register rejects non-iOS platforms', async () => {
+    const res = await request('POST', '/api/device/register', {
+      channel: 'testchannel123',
+      token: 'test-token',
+      platform: 'android',
+    });
+    assert.ok(res.status === 400 || res.status === 503);
+    if (res.status === 400) {
+      assert.ok(res.body.error.includes('iOS'));
+    }
   });
 });
 

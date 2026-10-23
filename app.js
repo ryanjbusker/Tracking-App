@@ -47,14 +47,13 @@ async function initNativePush() {
       console.log('Push token:', token.value);
       pushToken = token.value;
       
-      // Register with server
+      // Register with server (iOS APNs token)
       const p = profile();
       if (p) {
-        const platform = window.Capacitor.getPlatform() === 'ios' ? 'ios' : 'android';
         await fetch(`${API}/device/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ channel: p.channel, token: token.value, platform }),
+          body: JSON.stringify({ channel: p.channel, token: token.value, platform: 'ios' }),
         }).catch(console.error);
       }
     });
@@ -1058,11 +1057,10 @@ function viewFollow(ch, name) {
         if (res.ok) {
           // Re-register device to ensure we're registered
           if (pushToken) {
-            const platform = window.Capacitor.getPlatform() === 'ios' ? 'ios' : 'android';
             await fetch(`${API}/device/register`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ channel: myChannel, token: pushToken, platform }),
+              body: JSON.stringify({ channel: myChannel, token: pushToken, platform: 'ios' }),
             });
           }
           

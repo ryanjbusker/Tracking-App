@@ -18,7 +18,11 @@ const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
 const SELF_URL = process.env.RENDER_EXTERNAL_URL; // set automatically on Render
 const DATABASE_URL = process.env.DATABASE_URL;
-const FCM_SERVER_KEY = process.env.FCM_SERVER_KEY; // Firebase Cloud Messaging server key
+const APNS_KEY_ID = process.env.APNS_KEY_ID;
+const APNS_TEAM_ID = process.env.APNS_TEAM_ID;
+const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID;
+const APNS_KEY = process.env.APNS_KEY; // .p8 file contents
+const APNS_ENV = process.env.APNS_ENV || 'production'; // 'sandbox' or 'production'
 const POLL_MS = 5000;              // how often each active tail is polled
 const MIN_STEP = 4;                // seconds between stored track points
 const KEEP_SEC = 8 * 3600;         // how much track history to keep in memory
@@ -45,46 +49,114 @@ if (DATABASE_URL) {
   console.warn('WARNING: DATABASE_URL not set — native push notifications disabled');
 }
 
-/* ---------- Firebase Cloud Messaging ---------- */
-async function sendPush(tokens, notification) {
-  if (!FCM_SERVER_KEY) {
-    console.warn('FCM_SERVER_KEY not set, skipping push');
-    return { success: 0, failed: tokens.length };
+/* ---------- Apple Push Notification Service (APNs) ---------- */
+const http2 = require('node:http2');
+const crypto = require('node:crypto');
+
+let apnsJwt = null;
+let apnsJwtExpiry = 0;
+
+function generateApnsJwt() {
+  if (!APNS_KEY_ID || !APNS_TEAM_ID || !APNS_KEY) return null;
+  
+  const now = Math.floor(Date.now() / 1000);
+  if (apnsJwt && apnsJwtExpiry > now + 300) return apnsJwt; // reuse if >5 min left
+  
+  const header = { alg: 'ES256', kid: APNS_KEY_ID };
+  const payload = { iss: APNS_TEAM_ID, iat: now };
+  
+  const encode = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const token = `${encode(header)}.${encode(payload)}`;
+  
+  const sign = crypto.createSign('sha256');
+  sign.update(token);
+  sign.end();
+  const signature = sign.sign(APNS_KEY, 'base64url');
+  
+  apnsJwt = `${token}.${signature}`;
+  apnsJwtExpiry = now + 3600; // valid for 1 hour
+  return apnsJwt;
+}
+
+async function sendApnsPush(tokens, notification) {
+  if (!APNS_KEY_ID || !APNS_TEAM_ID || !APNS_KEY || !APNS_BUNDLE_ID) {
+    console.warn('APNs not configured, skipping push');
+    return { success: 0, failed: tokens.length, deleted: 0 };
   }
   
+  const jwt = generateApnsJwt();
+  if (!jwt) {
+    console.error('Failed to generate APNs JWT');
+    return { success: 0, failed: tokens.length, deleted: 0 };
+  }
+  
+  const host = APNS_ENV === 'sandbox' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
   const payload = JSON.stringify({
-    registration_ids: tokens,
-    notification: {
-      title: notification.title,
-      body: notification.body,
+    aps: {
+      alert: { title: notification.title, body: notification.body },
       sound: 'default',
       badge: 1,
+      'mutable-content': 1,
     },
-    data: notification.data || {},
-    priority: 'high',
+    url: notification.url || '',
+    type: notification.type || 'notification',
   });
+  
+  let success = 0, failed = 0, deleted = 0;
+  const deleteTokens = [];
+  
+  for (const token of tokens) {
+    const result = await sendSingleApns(host, token, jwt, payload);
+    if (result.success) success++;
+    else if (result.invalidToken) { deleted++; deleteTokens.push(token); }
+    else failed++;
+  }
+  
+  // Remove invalid tokens from database
+  if (db && deleteTokens.length > 0) {
+    try {
+      await db.query('DELETE FROM devices WHERE token = ANY($1)', [deleteTokens]);
+      console.log(`Deleted ${deleteTokens.length} invalid device tokens`);
+    } catch (err) {
+      console.error('Failed to delete invalid tokens:', err);
+    }
+  }
+  
+  return { success, failed, deleted };
+}
 
+function sendSingleApns(host, token, jwt, payload) {
   return new Promise((resolve) => {
-    const req = https.request('https://fcm.googleapis.com/fcm/send', {
-      method: 'POST',
-      headers: {
-        'Authorization': `key=${FCM_SERVER_KEY}`,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-      },
-    }, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        try {
-          const result = JSON.parse(data);
-          resolve({ success: result.success || 0, failed: result.failure || 0 });
-        } catch {
-          resolve({ success: 0, failed: tokens.length });
-        }
-      });
+    const client = http2.connect(`https://${host}`);
+    
+    const req = client.request({
+      ':method': 'POST',
+      ':scheme': 'https',
+      ':path': `/3/device/${token}`,
+      'authorization': `bearer ${jwt}`,
+      'apns-topic': APNS_BUNDLE_ID,
+      'apns-priority': '10',
+      'apns-push-type': 'alert',
     });
-    req.on('error', () => resolve({ success: 0, failed: tokens.length }));
+    
+    let responseData = '';
+    req.on('response', (headers) => {
+      const status = headers[':status'];
+      if (status === 200) {
+        client.close();
+        resolve({ success: true });
+      } else if (status === 410 || (status === 400 && responseData.includes('BadDeviceToken'))) {
+        client.close();
+        resolve({ success: false, invalidToken: true });
+      } else {
+        client.close();
+        resolve({ success: false });
+      }
+    });
+    
+    req.on('data', (chunk) => { responseData += chunk; });
+    req.on('error', () => { client.close(); resolve({ success: false }); });
+    
     req.write(payload);
     req.end();
   });
@@ -228,7 +300,7 @@ async function api(req, res, url) {
     const { channel, token, platform } = body;
     if (!channel || !token || !platform) return json(res, 400, { error: 'missing required fields' });
     if (!/^[a-z0-9]{8,32}$/i.test(channel)) return json(res, 400, { error: 'invalid channel' });
-    if (!['ios', 'android', 'web'].includes(platform)) return json(res, 400, { error: 'invalid platform' });
+    if (platform !== 'ios') return json(res, 400, { error: 'only iOS supported' });
     try {
       await db.query(
         `INSERT INTO devices (channel, token, platform, last_seen)
@@ -293,12 +365,17 @@ async function api(req, res, url) {
       const result = await db.query('SELECT token FROM devices WHERE channel = $1', [channel]);
       if (result.rows.length === 0) return json(res, 200, { sent: 0, message: 'no devices' });
       const tokens = result.rows.map((r) => r.token);
-      const pushResult = await sendPush(tokens, {
+      const pushResult = await sendApnsPush(tokens, {
         title: 'Contrail Test',
         body: 'Push notifications are working!',
-        data: { type: 'test' },
+        type: 'test',
       });
-      return json(res, 200, { sent: pushResult.success, failed: pushResult.failed, devices: tokens.length });
+      return json(res, 200, { 
+        sent: pushResult.success, 
+        failed: pushResult.failed, 
+        deleted: pushResult.deleted,
+        devices: tokens.length 
+      });
     } catch (err) {
       console.error('Test push failed:', err);
       return json(res, 500, { error: 'push failed' });
@@ -331,10 +408,11 @@ async function api(req, res, url) {
       if (result.rows.length > 0) {
         const tokens = result.rows.map((r) => r.token);
         const trackUrl = SELF_URL ? `${SELF_URL}#/track/${channel}/${encodeURIComponent(pilotName || 'Pilot')}` : '';
-        await sendPush(tokens, {
+        await sendApnsPush(tokens, {
           title: `${pilotName || 'A pilot'} started a flight`,
           body: `${tail}${type ? ' · ' + type : ''} — tap to follow along live.`,
-          data: { type: 'flight_start', channel, url: trackUrl },
+          type: 'flight_start',
+          url: trackUrl,
         });
       }
       
@@ -373,10 +451,11 @@ async function api(req, res, url) {
         const durationStr = duration ? `${(duration / 3600).toFixed(1)} h` : '';
         const distanceStr = distance && distance >= 1 ? `, ${Math.round(distance)} nm` : '';
         const trackUrl = SELF_URL ? `${SELF_URL}#/track/${channel}/${encodeURIComponent(pilotName || 'Pilot')}` : '';
-        await sendPush(tokens, {
+        await sendApnsPush(tokens, {
           title: `${pilotName || 'Pilot'} has landed`,
           body: `${tail}${durationStr ? ' · ' + durationStr + ' flight' + distanceStr : ''}.`,
-          data: { type: 'flight_end', channel, url: trackUrl },
+          type: 'flight_end',
+          url: trackUrl,
         });
       }
       

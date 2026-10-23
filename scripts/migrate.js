@@ -17,12 +17,12 @@ if (!DATABASE_URL) {
 }
 
 const SQL = `
--- Device tokens for push notifications
+-- Device tokens for push notifications (iOS only)
 CREATE TABLE IF NOT EXISTS devices (
   id SERIAL PRIMARY KEY,
   channel VARCHAR(32) NOT NULL,
   token TEXT NOT NULL UNIQUE,
-  platform VARCHAR(10) NOT NULL CHECK (platform IN ('ios', 'android', 'web')),
+  platform VARCHAR(10) NOT NULL CHECK (platform = 'ios'),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   last_seen TIMESTAMPTZ DEFAULT NOW()
 );
