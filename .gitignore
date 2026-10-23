@@ -1,3 +1,19 @@
 node_modules/
 .env
 
+# Capacitor
+ios/
+android/
+.capacitor/
+
+# Native platform build artifacts
+*.keystore
+*.p8
+*.mobileprovision
+google-services.json
+GoogleService-Info.plist
+
+# Database
+*.db
+*.sqlite
+

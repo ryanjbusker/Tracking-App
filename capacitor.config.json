@@ -1,0 +1,17 @@
+{
+  "appId": "com.contrail.app",
+  "appName": "Contrail",
+  "webDir": ".",
+  "server": {
+    "url": "https://contrail-xnd3.onrender.com",
+    "cleartext": false
+  },
+  "plugins": {
+    "PushNotifications": {
+      "presentationOptions": ["badge", "sound", "alert"]
+    }
+  },
+  "ios": {
+    "scheme": "Contrail"
+  }
+}

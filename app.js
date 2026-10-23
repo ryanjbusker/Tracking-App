@@ -19,6 +19,74 @@ const DEMO_ORIGIN = [39.3257, -76.4138]; // Martin State Airport (KMTN)
 const M2FT = 3.28084;
 const MS2KT = 1.943844;
 
+/* ---------- Capacitor / Native App Support ---------- */
+const isNative = typeof window.Capacitor !== 'undefined';
+let pushToken = null;
+
+async function initNativePush() {
+  if (!isNative) return;
+  
+  try {
+    const { PushNotifications } = window.Capacitor.Plugins;
+    
+    // Request permission
+    let permStatus = await PushNotifications.checkPermissions();
+    if (permStatus.receive === 'prompt') {
+      permStatus = await PushNotifications.requestPermissions();
+    }
+    if (permStatus.receive !== 'granted') {
+      console.warn('Push notification permission denied');
+      return;
+    }
+    
+    // Register for push
+    await PushNotifications.register();
+    
+    // Listen for registration
+    PushNotifications.addListener('registration', async (token) => {
+      console.log('Push token:', token.value);
+      pushToken = token.value;
+      
+      // Register with server
+      const p = profile();
+      if (p) {
+        const platform = window.Capacitor.getPlatform() === 'ios' ? 'ios' : 'android';
+        await fetch(`${API}/device/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channel: p.channel, token: token.value, platform }),
+        }).catch(console.error);
+      }
+    });
+    
+    // Handle push notification received
+    PushNotifications.addListener('pushNotificationReceived', (notification) => {
+      console.log('Push received:', notification);
+    });
+    
+    // Handle push notification tapped
+    PushNotifications.addListener('pushNotificationActionPerformed', (notification) => {
+      const data = notification.notification.data;
+      if (data.url) {
+        try {
+          const url = new URL(data.url);
+          location.hash = url.hash || '#/';
+        } catch {
+          if (data.channel) location.hash = `#/track/${data.channel}/Pilot`;
+        }
+      }
+    });
+    
+  } catch (err) {
+    console.error('Push init failed:', err);
+  }
+}
+
+// Initialize on boot
+if (isNative) {
+  document.addEventListener('DOMContentLoaded', initNativePush);
+}
+
 /* ---------- Tiny helpers ---------- */
 const app = document.getElementById('app');
 const $ = (s, r = document) => r.querySelector(s);
@@ -621,15 +689,28 @@ function viewFly() {
     flush();
     const end = now();
     const dur = end - a.start;
-    outbox.add({ topic: dataTopic(p.channel), body: { k: 'e', f: a.fid, t: end } });
+    
+    // Send via native push if available, otherwise ntfy.sh
+    if (isNative && db) {
+      apiPost('/flight/end', {
+        channel: p.channel,
+        tail: a.tail,
+        pilotName: p.name,
+        duration: dur,
+        distance: a.dist,
+      });
+    } else {
+      outbox.add({ topic: dataTopic(p.channel), body: { k: 'e', f: a.fid, t: end } });
+      outbox.add({ alert: {
+        topic: alertTopic(p.channel),
+        title: `${p.name} has landed`,
+        message: `${a.tail} · ${fmtHrs(dur)} flight${a.dist >= 1 ? `, ${Math.round(a.dist)} nm` : ''}.`,
+        click: trackUrl(p),
+        tags: ['white_check_mark'],
+      } });
+    }
+    
     apiPost('/track/end', { tail: a.tail });
-    outbox.add({ alert: {
-      topic: alertTopic(p.channel),
-      title: `${p.name} has landed`,
-      message: `${a.tail} · ${fmtHrs(dur)} flight${a.dist >= 1 ? `, ${Math.round(a.dist)} nm` : ''}.`,
-      click: trackUrl(p),
-      tags: ['white_check_mark'],
-    } });
     const log = store.get('log', []);
     log.unshift({ fid: a.fid, planeId: a.planeId, tail: a.tail, color: a.color, start: a.start, end, dist: a.dist, maxAlt: a.maxAlt });
     store.set('log', log.slice(0, 200));
@@ -708,14 +789,24 @@ function viewFly() {
   cleanup.push(() => { clearInterval(flushTimer); clearInterval(clock); clearInterval(register); clearInterval(adsbTimer); });
 
   if (!a.announced) {
-    outbox.add({ topic: dataTopic(p.channel), body: { k: 's', f: a.fid, n: p.name, tail: a.tail, type: a.type, c: a.color, t: a.start, iv: p.interval || 30 } });
-    outbox.add({ alert: {
-      topic: alertTopic(p.channel),
-      title: `${p.name} started a flight`,
-      message: `${a.tail}${a.type ? ' · ' + a.type : ''} — tap to follow along live.`,
-      click: trackUrl(p),
-      tags: ['airplane'],
-    } });
+    // Send via native push if available, otherwise ntfy.sh
+    if (isNative && db) {
+      apiPost('/flight/start', {
+        channel: p.channel,
+        tail: a.tail,
+        pilotName: p.name,
+        type: a.type,
+      });
+    } else {
+      outbox.add({ topic: dataTopic(p.channel), body: { k: 's', f: a.fid, n: p.name, tail: a.tail, type: a.type, c: a.color, t: a.start, iv: p.interval || 30 } });
+      outbox.add({ alert: {
+        topic: alertTopic(p.channel),
+        title: `${p.name} started a flight`,
+        message: `${a.tail}${a.type ? ' · ' + a.type : ''} — tap to follow along live.`,
+        click: trackUrl(p),
+        tags: ['airplane'],
+      } });
+    }
     a.announced = true;
     save();
     outbox.flush().then(paint);
@@ -922,6 +1013,79 @@ function viewFollow(ch, name) {
   const who = name || 'this pilot';
   const topic = alertTopic(ch);
   const live = `${baseUrl()}#/track/${ch}/${encodeURIComponent(name)}`;
+  
+  // In native app, show simplified follow flow
+  if (isNative) {
+    const myProfile = profile();
+    const myChannel = myProfile ? myProfile.channel : rid(16);
+    if (!myProfile) {
+      saveProfile({ name: 'Watcher', channel: myChannel, interval: 30, demo: false, watcherMode: true });
+    }
+    
+    app.innerHTML = `
+      <header class="topbar">
+        <a class="icon-btn" href="#/" aria-label="Back">${I.back}</a>
+        <div class="brand"><img src="icons/icon.svg" alt="">Contrail</div>
+        <span style="width:40px"></span>
+      </header>
+      <main class="page">
+        <section class="hero">
+          <p class="eyebrow">You're invited</p>
+          <h1>Follow ${esc(who)}'s flights</h1>
+          <p>Get a notification when ${esc(who)} starts a flight and when they land, then watch the whole flight live.</p>
+        </section>
+        <section>
+          <button class="btn btn-primary btn-lg btn-block" id="follow-btn">${I.bell}Follow ${esc(who)}</button>
+          <p class="hint" style="margin-top:12px;text-align:center">You'll get push notifications on this device when they fly.</p>
+        </section>
+        <section>
+          <a class="btn btn-block" href="${esc(live)}">${I.map}View live map</a>
+        </section>
+      </main>`;
+    
+    $('#follow-btn').onclick = async () => {
+      const btn = $('#follow-btn');
+      btn.disabled = true;
+      btn.textContent = 'Following...';
+      
+      try {
+        const res = await fetch(`${API}/follow`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pilotChannel: ch, followerChannel: myChannel }),
+        });
+        
+        if (res.ok) {
+          // Re-register device to ensure we're registered
+          if (pushToken) {
+            const platform = window.Capacitor.getPlatform() === 'ios' ? 'ios' : 'android';
+            await fetch(`${API}/device/register`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ channel: myChannel, token: pushToken, platform }),
+            });
+          }
+          
+          toast(`Following ${who}!`);
+          btn.innerHTML = `${I.check}Following`;
+          setTimeout(() => {
+            location.hash = `#/track/${ch}/${encodeURIComponent(name)}`;
+          }, 1000);
+        } else {
+          throw new Error('Follow failed');
+        }
+      } catch (err) {
+        console.error('Follow error:', err);
+        toast('Failed to follow. Try again.');
+        btn.disabled = false;
+        btn.innerHTML = `${I.bell}Follow ${esc(who)}`;
+      }
+    };
+    
+    return;
+  }
+  
+  // Web version: show ntfy instructions
   app.innerHTML = `
     <header class="topbar"><div class="brand"><img src="icons/icon.svg" alt="">Contrail</div></header>
     <main class="page">
