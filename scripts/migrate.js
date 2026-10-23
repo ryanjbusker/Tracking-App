@@ -58,7 +58,9 @@ CREATE INDEX IF NOT EXISTS idx_flight_events_created ON flight_events(created_at
 `;
 
 async function migrate() {
-  const client = new pg.Client({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  const isLocal = DATABASE_URL.includes('localhost') || DATABASE_URL.includes('127.0.0.1');
+  const sslConfig = isLocal ? false : { rejectUnauthorized: false };
+  const client = new pg.Client({ connectionString: DATABASE_URL, ssl: sslConfig });
   
   try {
     await client.connect();

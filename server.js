@@ -36,7 +36,9 @@ const TAIL_RE = /^[A-Z0-9-]{2,8}$/;
 /* ---------- Database ---------- */
 let db = null;
 if (DATABASE_URL) {
-  db = new pg.Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 10 });
+  const isLocal = DATABASE_URL.includes('localhost') || DATABASE_URL.includes('127.0.0.1');
+  const sslConfig = isLocal ? false : { rejectUnauthorized: false };
+  db = new pg.Pool({ connectionString: DATABASE_URL, ssl: sslConfig, max: 10 });
   db.on('error', (err) => console.error('Database pool error:', err));
   console.log('Database connected');
 } else {
