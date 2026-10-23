@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, cursor/** ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: contrail_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm install
+    
+    - name: Run database migrations
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/contrail_test
+      run: npm run db:migrate
+    
+    - name: Start server
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/contrail_test
+        PORT: 3000
+      run: |
+        npm start &
+        echo $! > server.pid
+        sleep 3
+    
+    - name: Run tests
+      env:
+        TEST_SERVER: http://localhost:3000
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/contrail_test
+      run: npm test
+    
+    - name: Stop server
+      if: always()
+      run: |
+        if [ -f server.pid ]; then
+          kill $(cat server.pid) || true
+          rm server.pid
+        fi
+  
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+    
+    - name: Check for syntax errors
+      run: |
+        node --check server.js
+        node --check app.js
+        node --check scripts/migrate.js

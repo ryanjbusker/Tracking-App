@@ -1,13 +1,24 @@
 {
   "name": "contrail",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "private": true,
   "description": "Live flight tracking for student pilots: ADS-B by tail number, with phone GPS backup.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/*.test.js",
+    "db:migrate": "node scripts/migrate.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.0.0",
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/ios": "^6.0.0",
+    "@capacitor/push-notifications": "^6.0.0"
   }
 }

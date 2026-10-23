@@ -1,0 +1,171 @@
+name: iOS Build and Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_to_testflight:
+        description: 'Upload to TestFlight'
+        required: false
+        default: 'true'
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Sync Capacitor
+        run: |
+          mkdir -p www
+          cp index.html app.js styles.css sw.js manifest.webmanifest www/
+          cp -r icons www/
+          npx cap sync ios
+      
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+          working-directory: ios/App
+      
+      - name: Install Fastlane
+        run: |
+          cd ios/App
+          gem install fastlane
+      
+      - name: Create Fastlane Appfile
+        run: |
+          cd ios/App
+          mkdir -p fastlane
+          cat > fastlane/Appfile << EOF
+          app_identifier("com.ryanbusker.contrail")
+          apple_id(ENV["APPLE_ID"])
+          team_id(ENV["APPLE_TEAM_ID"])
+          EOF
+      
+      - name: Create Fastlane Fastfile
+        run: |
+          cd ios/App
+          cat > fastlane/Fastfile << 'EOF'
+          default_platform(:ios)
+
+          platform :ios do
+            desc "Build and upload to TestFlight"
+            lane :beta do
+              # Set up App Store Connect API Key
+              app_store_connect_api_key(
+                key_id: ENV["ASC_KEY_ID"],
+                issuer_id: ENV["ASC_ISSUER_ID"],
+                key_content: ENV["ASC_KEY_P8"],
+                is_key_content_base64: false,
+                in_house: false
+              )
+
+              # Increment build number
+              increment_build_number(
+                xcodeproj: "App.xcodeproj",
+                build_number: latest_testflight_build_number(
+                  app_identifier: "com.ryanbusker.contrail",
+                  initial_build_number: 0
+                ) + 1
+              )
+
+              # Get certificates and provisioning profiles
+              cert(
+                api_key_path: nil,  # Will use app_store_connect_api_key
+                team_id: ENV["APPLE_TEAM_ID"]
+              )
+              
+              sigh(
+                api_key_path: nil,  # Will use app_store_connect_api_key
+                app_identifier: "com.ryanbusker.contrail",
+                team_id: ENV["APPLE_TEAM_ID"],
+                force: true,
+                adhoc: false
+              )
+
+              # Update project provisioning
+              update_project_provisioning(
+                xcodeproj: "App.xcodeproj",
+                target_filter: "App",
+                build_configuration: "Release"
+              )
+
+              # Build the app
+              build_app(
+                workspace: "App.xcworkspace",
+                scheme: "App",
+                configuration: "Release",
+                export_method: "app-store",
+                export_options: {
+                  provisioningProfiles: {
+                    "com.ryanbusker.contrail" => ENV["SIGH_COM_RYANBUSKER_CONTRAIL_APPSTORE"]
+                  }
+                }
+              )
+
+              # Upload to TestFlight
+              if ENV["UPLOAD_TO_TESTFLIGHT"] == "true"
+                upload_to_testflight(
+                  api_key_path: nil,  # Will use app_store_connect_api_key
+                  skip_waiting_for_build_processing: true,
+                  skip_submission: true
+                )
+              end
+            end
+          end
+          EOF
+      
+      - name: Create keychain
+        run: |
+          security create-keychain -p "${{ secrets.KEYCHAIN_PASSWORD || 'temporary' }}" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "${{ secrets.KEYCHAIN_PASSWORD || 'temporary' }}" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+      
+      - name: Install CocoaPods
+        run: |
+          cd ios/App
+          pod install
+      
+      - name: Build and Deploy
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD || 'temporary' }}
+          UPLOAD_TO_TESTFLIGHT: ${{ github.event.inputs.upload_to_testflight || 'true' }}
+          FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD: ${{ secrets.FASTLANE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          cd ios/App
+          fastlane beta
+      
+      - name: Upload IPA artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Contrail-iOS
+          path: ios/App/*.ipa
+          if-no-files-found: warn
+      
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain build.keychain || true

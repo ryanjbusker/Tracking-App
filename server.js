@@ -4,16 +4,25 @@
    Contrail server — serves the app and relays ADS-B (transponder) data.
    Browsers can't call the public ADS-B feeds directly (no CORS), so this
    polls them by tail number and keeps a short in-memory track per aircraft.
-   No dependencies; Node 18+.
+   
+   v2: Native mobile app support with PostgreSQL and Firebase Cloud Messaging
    ========================================================================= */
 
 const http = require('node:http');
+const https = require('node:https');
 const fs = require('node:fs');
 const path = require('node:path');
+const pg = require('pg');
 
 const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
 const SELF_URL = process.env.RENDER_EXTERNAL_URL; // set automatically on Render
+const DATABASE_URL = process.env.DATABASE_URL;
+const APNS_KEY_ID = process.env.APNS_KEY_ID;
+const APNS_TEAM_ID = process.env.APNS_TEAM_ID;
+const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID;
+const APNS_KEY = process.env.APNS_KEY; // .p8 file contents
+const APNS_ENV = process.env.APNS_ENV || 'production'; // 'sandbox' or 'production'
 const POLL_MS = 5000;              // how often each active tail is polled
 const MIN_STEP = 4;                // seconds between stored track points
 const KEEP_SEC = 8 * 3600;         // how much track history to keep in memory
@@ -27,6 +36,132 @@ const FEEDS = [
 ];
 
 const TAIL_RE = /^[A-Z0-9-]{2,8}$/;
+
+/* ---------- Database ---------- */
+let db = null;
+if (DATABASE_URL) {
+  const isLocal = DATABASE_URL.includes('localhost') || DATABASE_URL.includes('127.0.0.1');
+  const sslConfig = isLocal ? false : { rejectUnauthorized: false };
+  db = new pg.Pool({ connectionString: DATABASE_URL, ssl: sslConfig, max: 10 });
+  db.on('error', (err) => console.error('Database pool error:', err));
+  console.log('Database connected');
+} else {
+  console.warn('WARNING: DATABASE_URL not set — native push notifications disabled');
+}
+
+/* ---------- Apple Push Notification Service (APNs) ---------- */
+const http2 = require('node:http2');
+const crypto = require('node:crypto');
+
+let apnsJwt = null;
+let apnsJwtExpiry = 0;
+
+function generateApnsJwt() {
+  if (!APNS_KEY_ID || !APNS_TEAM_ID || !APNS_KEY) return null;
+  
+  const now = Math.floor(Date.now() / 1000);
+  if (apnsJwt && apnsJwtExpiry > now + 300) return apnsJwt; // reuse if >5 min left
+  
+  const header = { alg: 'ES256', kid: APNS_KEY_ID };
+  const payload = { iss: APNS_TEAM_ID, iat: now };
+  
+  const encode = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const token = `${encode(header)}.${encode(payload)}`;
+  
+  const sign = crypto.createSign('sha256');
+  sign.update(token);
+  sign.end();
+  const signature = sign.sign(APNS_KEY, 'base64url');
+  
+  apnsJwt = `${token}.${signature}`;
+  apnsJwtExpiry = now + 3600; // valid for 1 hour
+  return apnsJwt;
+}
+
+async function sendApnsPush(tokens, notification) {
+  if (!APNS_KEY_ID || !APNS_TEAM_ID || !APNS_KEY || !APNS_BUNDLE_ID) {
+    console.warn('APNs not configured, skipping push');
+    return { success: 0, failed: tokens.length, deleted: 0 };
+  }
+  
+  const jwt = generateApnsJwt();
+  if (!jwt) {
+    console.error('Failed to generate APNs JWT');
+    return { success: 0, failed: tokens.length, deleted: 0 };
+  }
+  
+  const host = APNS_ENV === 'sandbox' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
+  const payload = JSON.stringify({
+    aps: {
+      alert: { title: notification.title, body: notification.body },
+      sound: 'default',
+      badge: 1,
+      'mutable-content': 1,
+    },
+    url: notification.url || '',
+    type: notification.type || 'notification',
+  });
+  
+  let success = 0, failed = 0, deleted = 0;
+  const deleteTokens = [];
+  
+  for (const token of tokens) {
+    const result = await sendSingleApns(host, token, jwt, payload);
+    if (result.success) success++;
+    else if (result.invalidToken) { deleted++; deleteTokens.push(token); }
+    else failed++;
+  }
+  
+  // Remove invalid tokens from database
+  if (db && deleteTokens.length > 0) {
+    try {
+      await db.query('DELETE FROM devices WHERE token = ANY($1)', [deleteTokens]);
+      console.log(`Deleted ${deleteTokens.length} invalid device tokens`);
+    } catch (err) {
+      console.error('Failed to delete invalid tokens:', err);
+    }
+  }
+  
+  return { success, failed, deleted };
+}
+
+function sendSingleApns(host, token, jwt, payload) {
+  return new Promise((resolve) => {
+    const client = http2.connect(`https://${host}`);
+    
+    const req = client.request({
+      ':method': 'POST',
+      ':scheme': 'https',
+      ':path': `/3/device/${token}`,
+      'authorization': `bearer ${jwt}`,
+      'apns-topic': APNS_BUNDLE_ID,
+      'apns-priority': '10',
+      'apns-push-type': 'alert',
+    });
+    
+    let responseData = '';
+    req.on('response', (headers) => {
+      const status = headers[':status'];
+      if (status === 200) {
+        client.close();
+        resolve({ success: true });
+      } else if (status === 410 || (status === 400 && responseData.includes('BadDeviceToken'))) {
+        client.close();
+        resolve({ success: false, invalidToken: true });
+      } else {
+        client.close();
+        resolve({ success: false });
+      }
+    });
+    
+    req.on('data', (chunk) => { responseData += chunk; });
+    req.on('error', () => { client.close(); resolve({ success: false }); });
+    
+    req.write(payload);
+    req.end();
+  });
+}
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -156,6 +291,179 @@ async function api(req, res, url) {
     if (parts[2] === 'end') e.activeUntil = now() + 60;
     else { e.activeUntil = Math.max(e.activeUntil, now() + PILOT_TTL); if (now() - e.lastPoll > 2) poll(tail); }
     return json(res, 200, { ok: true });
+  }
+
+  // POST /api/device/register {channel, token, platform} — register device for push
+  if (req.method === 'POST' && parts[1] === 'device' && parts[2] === 'register') {
+    if (!db) return json(res, 503, { error: 'database not available' });
+    const body = await readBody(req);
+    const { channel, token, platform } = body;
+    if (!channel || !token || !platform) return json(res, 400, { error: 'missing required fields' });
+    if (!/^[a-z0-9]{8,32}$/i.test(channel)) return json(res, 400, { error: 'invalid channel' });
+    if (platform !== 'ios') return json(res, 400, { error: 'only iOS supported' });
+    try {
+      await db.query(
+        `INSERT INTO devices (channel, token, platform, last_seen)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (token) DO UPDATE SET channel = $1, last_seen = NOW()`,
+        [channel, token, platform]
+      );
+      return json(res, 200, { ok: true });
+    } catch (err) {
+      console.error('Device registration failed:', err);
+      return json(res, 500, { error: 'database error' });
+    }
+  }
+
+  // POST /api/follow {pilotChannel, followerChannel} — follow a pilot
+  if (req.method === 'POST' && parts[1] === 'follow') {
+    if (!db) return json(res, 503, { error: 'database not available' });
+    const body = await readBody(req);
+    const { pilotChannel, followerChannel } = body;
+    if (!pilotChannel || !followerChannel) return json(res, 400, { error: 'missing required fields' });
+    if (!/^[a-z0-9]{8,32}$/i.test(pilotChannel) || !/^[a-z0-9]{8,32}$/i.test(followerChannel)) {
+      return json(res, 400, { error: 'invalid channel format' });
+    }
+    try {
+      await db.query(
+        `INSERT INTO followers (pilot_channel, follower_channel)
+         VALUES ($1, $2)
+         ON CONFLICT (pilot_channel, follower_channel) DO NOTHING`,
+        [pilotChannel, followerChannel]
+      );
+      return json(res, 200, { ok: true });
+    } catch (err) {
+      console.error('Follow failed:', err);
+      return json(res, 500, { error: 'database error' });
+    }
+  }
+
+  // GET /api/following/:channel — get pilots this user is following
+  if (req.method === 'GET' && parts[1] === 'following' && parts[2]) {
+    if (!db) return json(res, 503, { error: 'database not available' });
+    const channel = decodeURIComponent(parts[2]);
+    if (!/^[a-z0-9]{8,32}$/i.test(channel)) return json(res, 400, { error: 'invalid channel' });
+    try {
+      const result = await db.query(
+        'SELECT pilot_channel, created_at FROM followers WHERE follower_channel = $1',
+        [channel]
+      );
+      return json(res, 200, { following: result.rows });
+    } catch (err) {
+      console.error('Get following failed:', err);
+      return json(res, 500, { error: 'database error' });
+    }
+  }
+
+  // POST /api/push/test {channel} — send test push (dev only)
+  if (req.method === 'POST' && parts[1] === 'push' && parts[2] === 'test') {
+    if (!db) return json(res, 503, { error: 'database not available' });
+    const body = await readBody(req);
+    const { channel } = body;
+    if (!channel) return json(res, 400, { error: 'missing channel' });
+    try {
+      const result = await db.query('SELECT token FROM devices WHERE channel = $1', [channel]);
+      if (result.rows.length === 0) return json(res, 200, { sent: 0, message: 'no devices' });
+      const tokens = result.rows.map((r) => r.token);
+      const pushResult = await sendApnsPush(tokens, {
+        title: 'Contrail Test',
+        body: 'Push notifications are working!',
+        type: 'test',
+      });
+      return json(res, 200, { 
+        sent: pushResult.success, 
+        failed: pushResult.failed, 
+        deleted: pushResult.deleted,
+        devices: tokens.length 
+      });
+    } catch (err) {
+      console.error('Test push failed:', err);
+      return json(res, 500, { error: 'push failed' });
+    }
+  }
+
+  // POST /api/flight/start {channel, tail, pilotName, type} — pilot started, send pushes to followers
+  if (req.method === 'POST' && parts[1] === 'flight' && parts[2] === 'start') {
+    if (!db) return json(res, 503, { error: 'database not available' });
+    const body = await readBody(req);
+    const { channel, tail, pilotName, type } = body;
+    if (!channel || !tail) return json(res, 400, { error: 'missing required fields' });
+    try {
+      // Log the event
+      await db.query(
+        `INSERT INTO flight_events (channel, event_type, tail, pilot_name, data)
+         VALUES ($1, 'start', $2, $3, $4)`,
+        [channel, tail, pilotName, JSON.stringify({ type })]
+      );
+      
+      // Get follower devices
+      const result = await db.query(
+        `SELECT DISTINCT d.token 
+         FROM followers f 
+         JOIN devices d ON f.follower_channel = d.channel 
+         WHERE f.pilot_channel = $1`,
+        [channel]
+      );
+      
+      if (result.rows.length > 0) {
+        const tokens = result.rows.map((r) => r.token);
+        const trackUrl = SELF_URL ? `${SELF_URL}#/track/${channel}/${encodeURIComponent(pilotName || 'Pilot')}` : '';
+        await sendApnsPush(tokens, {
+          title: `${pilotName || 'A pilot'} started a flight`,
+          body: `${tail}${type ? ' · ' + type : ''} — tap to follow along live.`,
+          type: 'flight_start',
+          url: trackUrl,
+        });
+      }
+      
+      return json(res, 200, { ok: true, notified: result.rows.length });
+    } catch (err) {
+      console.error('Flight start notification failed:', err);
+      return json(res, 500, { error: 'notification failed' });
+    }
+  }
+
+  // POST /api/flight/end {channel, tail, pilotName, duration, distance} — pilot landed
+  if (req.method === 'POST' && parts[1] === 'flight' && parts[2] === 'end') {
+    if (!db) return json(res, 503, { error: 'database not available' });
+    const body = await readBody(req);
+    const { channel, tail, pilotName, duration, distance } = body;
+    if (!channel || !tail) return json(res, 400, { error: 'missing required fields' });
+    try {
+      // Log the event
+      await db.query(
+        `INSERT INTO flight_events (channel, event_type, tail, pilot_name, data)
+         VALUES ($1, 'end', $2, $3, $4)`,
+        [channel, tail, pilotName, JSON.stringify({ duration, distance })]
+      );
+      
+      // Get follower devices
+      const result = await db.query(
+        `SELECT DISTINCT d.token 
+         FROM followers f 
+         JOIN devices d ON f.follower_channel = d.channel 
+         WHERE f.pilot_channel = $1`,
+        [channel]
+      );
+      
+      if (result.rows.length > 0) {
+        const tokens = result.rows.map((r) => r.token);
+        const durationStr = duration ? `${(duration / 3600).toFixed(1)} h` : '';
+        const distanceStr = distance && distance >= 1 ? `, ${Math.round(distance)} nm` : '';
+        const trackUrl = SELF_URL ? `${SELF_URL}#/track/${channel}/${encodeURIComponent(pilotName || 'Pilot')}` : '';
+        await sendApnsPush(tokens, {
+          title: `${pilotName || 'Pilot'} has landed`,
+          body: `${tail}${durationStr ? ' · ' + durationStr + ' flight' + distanceStr : ''}.`,
+          type: 'flight_end',
+          url: trackUrl,
+        });
+      }
+      
+      return json(res, 200, { ok: true, notified: result.rows.length });
+    } catch (err) {
+      console.error('Flight end notification failed:', err);
+      return json(res, 500, { error: 'notification failed' });
+    }
   }
 
   if (req.method === 'OPTIONS') {
