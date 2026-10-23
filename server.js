@@ -49,6 +49,79 @@ if (DATABASE_URL) {
   console.warn('WARNING: DATABASE_URL not set — native push notifications disabled');
 }
 
+/* ---------- Database Migration ---------- */
+const MIGRATION_SQL = `
+-- Device tokens for push notifications (iOS only)
+CREATE TABLE IF NOT EXISTS devices (
+  id SERIAL PRIMARY KEY,
+  channel VARCHAR(32) NOT NULL,
+  token TEXT NOT NULL UNIQUE,
+  platform VARCHAR(10) NOT NULL CHECK (platform = 'ios'),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  last_seen TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_devices_channel ON devices(channel);
+CREATE INDEX IF NOT EXISTS idx_devices_token ON devices(token);
+
+-- Follower relationships (pilot channel -> follower channel)
+CREATE TABLE IF NOT EXISTS followers (
+  id SERIAL PRIMARY KEY,
+  pilot_channel VARCHAR(32) NOT NULL,
+  follower_channel VARCHAR(32) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(pilot_channel, follower_channel)
+);
+
+CREATE INDEX IF NOT EXISTS idx_followers_pilot ON followers(pilot_channel);
+CREATE INDEX IF NOT EXISTS idx_followers_follower ON followers(follower_channel);
+
+-- Flight events log (for debugging and history)
+CREATE TABLE IF NOT EXISTS flight_events (
+  id SERIAL PRIMARY KEY,
+  channel VARCHAR(32) NOT NULL,
+  event_type VARCHAR(20) NOT NULL CHECK (event_type IN ('start', 'end')),
+  tail VARCHAR(10),
+  pilot_name VARCHAR(50),
+  data JSONB,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_flight_events_channel ON flight_events(channel);
+CREATE INDEX IF NOT EXISTS idx_flight_events_created ON flight_events(created_at);
+`;
+
+async function runMigration(retries = 3) {
+  if (!db) {
+    console.log('Skipping migration: DATABASE_URL not set');
+    return;
+  }
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      console.log(`Running database migration (attempt ${attempt}/${retries})...`);
+      await db.query(MIGRATION_SQL);
+      console.log('✓ Migration complete: devices, followers, flight_events tables ready');
+      return;
+    } catch (err) {
+      console.error(`Migration attempt ${attempt} failed:`, err.message);
+      if (attempt < retries) {
+        const delay = attempt * 1000; // 1s, 2s, 3s
+        console.log(`Retrying in ${delay}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      } else {
+        console.error('⚠ Migration failed after all retries. Server will continue but database features may not work.');
+        console.error('⚠ Check DATABASE_URL and database connectivity.');
+      }
+    }
+  }
+}
+
+// Run migration on startup (non-blocking)
+if (db) {
+  runMigration().catch((err) => console.error('Migration error:', err));
+}
+
 /* ---------- Apple Push Notification Service (APNs) ---------- */
 const http2 = require('node:http2');
 const crypto = require('node:crypto');
