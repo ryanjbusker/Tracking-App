@@ -42,7 +42,7 @@ Go to Render → contrail service → **Environment** and add:
 ```bash
 APNS_KEY_ID=ABC123XYZ          # Your Key ID from Apple
 APNS_TEAM_ID=DEF456UVW         # Your Team ID from Apple
-APNS_BUNDLE_ID=com.contrail.app
+APNS_BUNDLE_ID=com.ryanbusker.contrail
 APNS_ENV=sandbox               # Use 'sandbox' for dev, 'production' for TestFlight/App Store
 ```
 

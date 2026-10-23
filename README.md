@@ -123,7 +123,7 @@ DATABASE_URL=postgresql://user:pass@dpg-xxx.oregon-postgres.render.com/contrail_
 # APNs Configuration
 APNS_KEY_ID=ABC123XYZ      # Key ID from Apple (10 characters)
 APNS_TEAM_ID=DEF456UVW     # Team ID from Apple (10 characters)
-APNS_BUNDLE_ID=com.contrail.app
+APNS_BUNDLE_ID=com.ryanbusker.contrail
 APNS_ENV=production        # Use 'sandbox' for development, 'production' for TestFlight/App Store
 
 # APNs Key (.p8 file contents - see below for how to set this)
@@ -147,7 +147,7 @@ MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQg...
    - **Platform**: iOS
    - **Name**: Contrail
    - **Primary Language**: English (U.S.)
-   - **Bundle ID**: Create new → `com.contrail.app` (must match capacitor.config.json)
+   - **Bundle ID**: Create new → `com.ryanbusker.contrail` (must match capacitor.config.json)
    - **SKU**: `contrail-ios-001`
    - **User Access**: Full Access
 3. Fill out app metadata:
@@ -195,7 +195,7 @@ Host this somewhere (GitHub Pages, your website, etc.) and link to it.
 
 5. **Signing & Capabilities** tab:
    - **Team**: Select your Apple Developer team
-   - **Bundle Identifier**: `com.contrail.app` (must match App Store Connect)
+   - **Bundle Identifier**: `com.ryanbusker.contrail` (must match App Store Connect)
    - Xcode will automatically create/update provisioning profiles
 
 6. Add **Push Notifications** capability:
@@ -392,6 +392,219 @@ For future updates:
 
 ---
 
+
+---
+
+## 🚀 Alternative: Build iOS App Without a Mac (GitHub Actions)
+
+**Don't have a Mac?** You can build and deploy to TestFlight entirely from GitHub Actions running on cloud macOS runners.
+
+### Prerequisites
+
+1. ✅ **Enroll in Apple Developer Program** ($99/year)
+   - Go to https://developer.apple.com/programs/
+   - Complete enrollment
+   - Wait for approval (24-48 hours)
+
+### Step 1: Create App ID in Apple Developer Portal
+
+1. Go to https://developer.apple.com/account
+2. **Certificates, Identifiers & Profiles** → **Identifiers**
+3. Click **+** to create new identifier
+4. Select **App IDs** → Continue
+5. Select **App** → Continue
+6. **Description**: Contrail
+7. **Bundle ID**: Explicit → `com.ryanbusker.contrail`
+8. **Capabilities**: Check **Push Notifications**
+9. Click **Continue** → **Register**
+
+### Step 2: Create App in App Store Connect
+
+1. Go to https://appstoreconnect.apple.com/
+2. Click **Apps** → **+** → **New App**
+3. **Platform**: iOS
+4. **Name**: Contrail
+5. **Primary Language**: English (U.S.)
+6. **Bundle ID**: Select `com.ryanbusker.contrail` (from Step 1)
+7. **SKU**: `contrail-ios-001` (any unique string)
+8. **User Access**: Full Access
+9. Click **Create**
+
+You don't need to fill out metadata yet - we'll test in TestFlight first.
+
+### Step 3: Create App Store Connect API Key
+
+1. In App Store Connect, go to **Users and Access** (top right)
+2. Click **Integrations** tab
+3. Click **App Store Connect API** section
+4. Click **+** (Generate API Key)
+5. **Name**: GitHub Actions
+6. **Access**: **App Manager** (need this level to upload builds)
+7. Click **Generate**
+8. **Download** the API Key (`.p8` file) - you can only download once!
+9. Note the **Key ID** (shows in the table, e.g., `2X9R4HXF34`)
+10. Note the **Issuer ID** (at the top of the page, e.g., `57246542-96fe-1a63-e053-0824d011072a`)
+
+### Step 4: Add GitHub Secrets
+
+Go to your GitHub repository → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
+
+Add these secrets (exact names required):
+
+```
+Secret Name: ASC_KEY_ID
+Value: [Your Key ID from Step 3, e.g., 2X9R4HXF34]
+
+Secret Name: ASC_ISSUER_ID  
+Value: [Your Issuer ID from Step 3, e.g., 57246542-96fe-1a63-e053-0824d011072a]
+
+Secret Name: ASC_KEY_P8
+Value: [Contents of the .p8 file from Step 3, including BEGIN/END lines]
+Example:
+-----BEGIN PRIVATE KEY-----
+MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQg...
+(entire key)
+-----END PRIVATE KEY-----
+
+Secret Name: APPLE_TEAM_ID
+Value: [Your Team ID from Apple Developer Portal, e.g., ABC123XYZ]
+(Find it: Developer Portal → Account → Membership → Team ID)
+
+Secret Name: APPLE_ID
+Value: [Your Apple ID email, e.g., ryan@example.com]
+
+Secret Name: FASTLANE_APP_SPECIFIC_PASSWORD
+Value: [Generate at appleid.apple.com → Security → App-Specific Passwords]
+```
+
+**Optional but recommended:**
+```
+Secret Name: MATCH_PASSWORD
+Value: [Any password - used if you want to use fastlane match later]
+
+Secret Name: KEYCHAIN_PASSWORD  
+Value: [Any password - used for temporary keychain, default: 'temporary']
+```
+
+### Step 5: Run the GitHub Actions Workflow
+
+1. Go to your GitHub repository
+2. Click **Actions** tab
+3. Click **iOS Build and Deploy** workflow (left sidebar)
+4. Click **Run workflow** (right side)
+5. Select branch: `cursor/native-app-push-notifications-90c8`
+6. Keep "Upload to TestFlight" checked
+7. Click **Run workflow**
+
+The workflow will:
+- ✅ Install dependencies
+- ✅ Sync Capacitor
+- ✅ Install CocoaPods
+- ✅ Auto-increment build number
+- ✅ Get certificates and provisioning profiles
+- ✅ Build release IPA
+- ✅ Upload to TestFlight
+
+This takes about **15-20 minutes** on GitHub's macOS runners.
+
+### Step 6: Install from TestFlight
+
+1. Install **TestFlight** app on your iPhone (from App Store)
+2. After workflow completes (15-20 min), wait **5-15 minutes** for Apple to process
+3. Open TestFlight app
+4. You'll see **Contrail** - tap **Install**
+5. Test the app!
+
+### Step 7: Create APNs Key and Configure Render
+
+Now that you can test on device:
+
+1. **Create APNs Key** (same as before):
+   - Developer Portal → Keys → + → Enable APNs
+   - Download `.p8` file
+   - Note Key ID and Team ID
+
+2. **Set Render Environment Variables**:
+   ```bash
+   DATABASE_URL=postgresql://... (your Postgres URL)
+   APNS_KEY_ID=ABC123XYZ
+   APNS_TEAM_ID=DEF456UVW
+   APNS_BUNDLE_ID=com.ryanbusker.contrail
+   APNS_KEY=-----BEGIN PRIVATE KEY-----
+   (entire .p8 key)
+   -----END PRIVATE KEY-----
+   APNS_ENV=production
+   ```
+
+3. **Test push notifications**:
+   ```bash
+   curl -X POST https://contrail-xnd3.onrender.com/api/push/test \
+     -H "Content-Type: application/json" \
+     -d '{"channel": "your-channel-id"}'
+   ```
+
+### Troubleshooting
+
+**Workflow fails at "Get certificates":**
+- Check all secrets are set correctly
+- Verify APPLE_ID and APPLE_TEAM_ID match your account
+- Make sure ASC_KEY_P8 includes BEGIN/END lines
+
+**"No suitable application records" error:**
+- You need to create the app in App Store Connect (Step 2)
+- Bundle ID must match exactly: `com.ryanbusker.contrail`
+
+**"Invalid credentials" error:**
+- ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 must match exactly
+- Re-download API key if needed (can only download once)
+
+**TestFlight doesn't show the app:**
+- Wait 5-15 minutes after workflow completes for Apple to process
+- Check your email - Apple sends confirmation when ready
+- Check App Store Connect → TestFlight → Builds
+
+**Build increments incorrectly:**
+- Workflow uses `latest_testflight_build_number` + 1
+- First build will be build 1, then 2, 3, etc.
+
+### Future Builds
+
+For subsequent releases:
+
+1. Make code changes
+2. Push to branch or create a new tag: `git tag v2.0.1 && git push --tags`
+3. Go to Actions → Run workflow (or it triggers automatically on tags)
+4. TestFlight updates automatically
+
+### Submit to App Review (when ready)
+
+1. In App Store Connect → Contrail → App Store tab
+2. Fill out metadata (screenshots, description, etc.)
+3. Select the TestFlight build
+4. Submit for Review
+5. Wait 1-3 days
+
+Full metadata guide in the main checklist above.
+
+### Summary: No-Mac Workflow
+
+```
+✅ Enroll in Apple Developer Program ($99/year)
+✅ Create App ID in Developer Portal (com.ryanbusker.contrail with Push)
+✅ Create App in App Store Connect
+✅ Generate App Store Connect API Key (.p8 file)
+✅ Add 6 GitHub Secrets (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8, APPLE_TEAM_ID, APPLE_ID, FASTLANE_APP_SPECIFIC_PASSWORD)
+✅ Run GitHub Actions workflow
+✅ Install from TestFlight on iPhone
+✅ Create APNs Key and set Render env vars
+✅ Test push notifications
+✅ Submit for App Review when ready
+```
+
+**Total time: ~1 hour for setup, then 15-20 min per build**
+
+**Cost: $99/year (Apple Developer) + GitHub Actions free tier (2000 min/month macOS builds)**
+
 ## Future: Android Support
 
 Android support was removed to simplify the initial launch. To add it later:
@@ -420,7 +633,7 @@ createdb contrail_dev
 export DATABASE_URL=postgresql://localhost/contrail_dev
 export APNS_KEY_ID=ABC123XYZ
 export APNS_TEAM_ID=DEF456UVW
-export APNS_BUNDLE_ID=com.contrail.app
+export APNS_BUNDLE_ID=com.ryanbusker.contrail
 export APNS_KEY="$(cat /path/to/AuthKey_ABC123XYZ.p8)"
 export APNS_ENV=sandbox
 
@@ -529,7 +742,7 @@ CREATE TABLE flight_events (
 **iOS:**
 1. Check that APNs environment variables are set correctly in Render:
    - `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID`, `APNS_KEY`, `APNS_ENV`
-2. Verify Bundle ID matches everywhere (`com.contrail.app`)
+2. Verify Bundle ID matches everywhere (`com.ryanbusker.contrail`)
 3. Ensure Push Notifications capability is enabled in Xcode
 4. Check device token is being registered: look for console log "Push token: ..."
 5. Test on a real device (push doesn't work in simulator)

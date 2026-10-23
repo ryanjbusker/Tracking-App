@@ -41,7 +41,7 @@ DATABASE_URL=postgresql://user:pass@dpg-xxx.oregon-postgres.render.com/contrail_
 # APNs Configuration (NEW - replaces FCM_SERVER_KEY)
 APNS_KEY_ID=ABC123XYZ           # From Apple Developer Portal (10 chars)
 APNS_TEAM_ID=DEF456UVW          # From Apple Developer Portal (10 chars)
-APNS_BUNDLE_ID=com.contrail.app # Must match Xcode project
+APNS_BUNDLE_ID=com.ryanbusker.contrail # Must match Xcode project
 APNS_ENV=production             # 'sandbox' for dev, 'production' for TestFlight/App Store
 
 # APNs Key (contents of .p8 file)
@@ -209,7 +209,7 @@ function generateApnsJwt() {
 POST /3/device/{device-token}
 Host: api.push.apple.com (or api.sandbox.push.apple.com)
 Authorization: bearer {jwt}
-apns-topic: com.contrail.app
+apns-topic: com.ryanbusker.contrail
 apns-priority: 10
 apns-push-type: alert
 

@@ -1,10 +1,14 @@
 node_modules/
 .env
 
-# Capacitor
-ios/
-android/
+# Capacitor - commit iOS project, ignore build artifacts
 .capacitor/
+ios/App/Pods/
+ios/App/Podfile.lock
+ios/App/build/
+ios/App/*.xcworkspace/
+ios/App/.DS_Store
+www/
 
 # Native platform build artifacts
 *.keystore
