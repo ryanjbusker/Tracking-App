@@ -292,12 +292,14 @@ const now = () => Math.floor(Date.now() / 1000);
 const num = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
 
 /* ---------- ADS-B tracking ---------- */
-// tail -> { activeUntil, track: [[t, lat, lon, alt, gs, trk]], ac, lastPoll, feedOk, backoffUntil }
+// tail -> { activeUntil, track, ac, lastPoll, feedOk, hex, traffic, isActiveFlight, lastClientRead }
 const tails = new Map();
 // Cache feed results to avoid hammering APIs
 const feedCache = new Map(); // tail -> { data, fetchedAt }
 // Cache traffic results
 const trafficCache = new Map(); // tail -> { data, fetchedAt }
+
+const IDLE_TIMEOUT = 5 * 60; // Drop tails with no client reads for 5 min
 
 function entry(tail) {
   let e = tails.get(tail);
@@ -306,7 +308,17 @@ function entry(tail) {
       const oldest = [...tails].sort((a, b) => a[1].activeUntil - b[1].activeUntil)[0];
       tails.delete(oldest[0]);
     }
-    e = { activeUntil: 0, track: [], ac: null, lastPoll: 0, feedOk: null, hex: null, traffic: [] };
+    e = { 
+      activeUntil: 0, 
+      track: [], 
+      ac: null, 
+      lastPoll: 0, 
+      feedOk: null, 
+      hex: null, 
+      traffic: [], 
+      isActiveFlight: false,
+      lastClientRead: 0,
+    };
     tails.set(tail, e);
   }
   return e;
@@ -431,11 +443,14 @@ async function fetchFeed(tail) {
 async function poll(tail) {
   const e = entry(tail);
   
+  // ONLY poll if this is an active flight
+  if (!e.isActiveFlight) return;
+  
   e.lastPoll = now();
   
-  // Try ADSBX first (combined query for position + traffic)
+  // Try ADSBX first (combined query for position + traffic) ONLY for active flights
   let data = null;
-  if (ADSBX_KEY && canMakeRequest()) {
+  if (ADSBX_KEY && canMakeRequest() && e.isActiveFlight) {
     // Use radius search if we have last known position (efficient: gets plane + traffic)
     if (e.ac && e.ac.lat != null && e.ac.lon != null) {
       data = await fetchADSBX(tail, e.ac.lat, e.ac.lon, e.hex);
@@ -595,8 +610,35 @@ setInterval(async () => {
   if (polling) return;
   polling = true;
   const t = now();
-  const active = [...tails].filter(([, e]) => e.activeUntil > t && t - e.lastPoll >= POLL_MS / 1000 - 1).map(([k]) => k);
+  
+  // Only poll active flights, and check for idle timeout
+  const active = [...tails].filter(([, e]) => {
+    // Drop if not an active flight
+    if (!e.isActiveFlight) return false;
+    // Drop if activeUntil expired
+    if (e.activeUntil <= t) {
+      e.isActiveFlight = false;
+      return false;
+    }
+    // Drop if no client reads for 5 min
+    if (e.lastClientRead && t - e.lastClientRead > IDLE_TIMEOUT) {
+      console.log(`[${e}] Dropping idle tail (no reads for 5min)`);
+      e.isActiveFlight = false;
+      return false;
+    }
+    // Only poll if enough time has passed
+    return t - e.lastPoll >= POLL_MS / 1000 - 1;
+  }).map(([k]) => k);
+  
   await Promise.all(active.map(poll));
+  
+  // Clean up inactive tails
+  for (const [tail, e] of tails) {
+    if (!e.isActiveFlight && e.activeUntil <= t) {
+      tails.delete(tail);
+    }
+  }
+  
   polling = false;
 }, POLL_MS);
 
@@ -627,13 +669,37 @@ async function api(req, res, url) {
   const parts = url.pathname.split('/').filter(Boolean); // ['api', ...]
 
   // GET /api/ac/:tail?since=unix -> current position + track since `since`
-  // Client reads from cache only - does NOT trigger polling
+  // Client reads from cache only - does NOT trigger polling or add to active list
   if (req.method === 'GET' && parts[1] === 'ac' && parts[2]) {
     const tail = normalizeTail(decodeURIComponent(parts[2]));
     if (!TAIL_RE.test(tail)) return json(res, 400, { error: 'bad tail' });
     const e = entry(tail);
-    e.activeUntil = Math.max(e.activeUntil, now() + WATCH_TTL);
-    // Do NOT poll here - client reads from shared poller's cache
+    
+    // Mark that client read this tail (for idle timeout)
+    e.lastClientRead = now();
+    
+    // For non-active flights, do one on-demand lookup using FREE feeds (save ADSBX for active)
+    if (!e.isActiveFlight && (!e.ac || now() - e.lastPoll > 30)) {
+      e.lastPoll = now();
+      const data = await fetchFeed(tail);
+      if (data) {
+        const list = Array.isArray(data.ac) ? data.ac : [];
+        const ac = list.find((a) => (a.r || '').toUpperCase() === tail) || list[0];
+        if (ac && num(ac.lat) != null && num(ac.lon) != null) {
+          const feedNow = num(data.now) ? data.now / 1000 : Date.now() / 1000;
+          const t = Math.round(feedNow - (num(ac.seen_pos) ?? num(ac.seen) ?? 0));
+          const ground = ac.alt_baro === 'ground';
+          const alt = ground ? 0 : num(ac.alt_baro) ?? num(ac.alt_geom);
+          const gs = num(ac.gs), trk = num(ac.track) ?? num(ac.true_heading);
+          e.ac = {
+            visible: now() - t < 60,
+            hex: ac.hex, type: ac.t || null, desc: ac.desc || null, squawk: ac.squawk || null,
+            t, lat: ac.lat, lon: ac.lon, alt, ground, gs, trk,
+          };
+        }
+      }
+    }
+    
     const since = Number(url.searchParams.get('since')) || 0;
     return json(res, 200, { tail, ac: e.ac, track: e.track.filter((p) => p[0] > since), feedOk: e.feedOk, polledAt: e.lastPoll });
   }
@@ -644,13 +710,15 @@ async function api(req, res, url) {
     const tail = normalizeTail(decodeURIComponent(parts[2]));
     if (!TAIL_RE.test(tail)) return json(res, 400, { error: 'bad tail' });
     const e = entry(tail);
+    e.lastClientRead = now();
+    
     if (!e.ac || num(e.ac.lat) == null || num(e.ac.lon) == null) {
       return json(res, 200, { traffic: [], nearest: null });
     }
     
     // Use traffic from last poll() (already extracted from radius query)
     const enriched = e.traffic.map((a) => {
-      const dist = distanceNm(e.ac.lat, e.ac.lon, a.lat, a.lon);
+      const dist = +(distanceNm(e.ac.lat, e.ac.lon, a.lat, a.lon).toFixed(1));
       const bearing = bearingTo(e.ac.lat, e.ac.lon, a.lat, a.lon);
       const relAlt = a.alt - (e.ac.alt || 0);
       const clock = e.ac.trk != null ? clockPosition(bearing, e.ac.trk) : null;
@@ -667,6 +735,7 @@ async function api(req, res, url) {
 
   // GET /api/health -> server health and request stats
   if (req.method === 'GET' && parts[1] === 'health') {
+    const activeFlights = [...tails.values()].filter(e => e.isActiveFlight && e.activeUntil > now());
     return json(res, 200, {
       ok: true,
       adsbx: {
@@ -676,20 +745,31 @@ async function api(req, res, url) {
         remaining: REQUEST_CAP - monthlyRequests,
       },
       activeTails: tails.size,
+      activeFlights: activeFlights.length,
+      activeFlightTails: activeFlights.map(e => tails.entries().find(([, v]) => v === e)?.[0]).filter(Boolean),
       uptime: process.uptime(),
     });
   }
 
-  // POST /api/track {tail}  — pilot started a flight
+  // POST /api/track {tail}  — pilot started a flight (ONLY way to enable ADSBX polling)
   // POST /api/track/end {tail} — pilot ended it
   if (req.method === 'POST' && parts[1] === 'track') {
     const body = await readBody(req);
     const tail = normalizeTail(String(body.tail || ''));
     if (!TAIL_RE.test(tail)) return json(res, 400, { error: 'bad tail' });
     const e = entry(tail);
-    if (parts[2] === 'end') e.activeUntil = now() + 60;
-    else { e.activeUntil = Math.max(e.activeUntil, now() + PILOT_TTL); }
-    // Polling happens in shared background poller, not per-request
+    if (parts[2] === 'end') {
+      // End flight - stop ADSBX polling
+      e.activeUntil = now() + 60;
+      e.isActiveFlight = false;
+      console.log(`[${tail}] Flight ended, stopped ADSBX polling`);
+    } else {
+      // Start flight - enable ADSBX polling
+      e.activeUntil = Math.max(e.activeUntil, now() + PILOT_TTL);
+      e.isActiveFlight = true;
+      e.lastClientRead = now();
+      console.log(`[${tail}] Flight started, enabled ADSBX polling`);
+    }
     return json(res, 200, { ok: true });
   }
 
