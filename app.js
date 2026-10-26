@@ -546,108 +546,22 @@ function startFlight(plane) {
   location.hash = '#/fly';
 }
 
-async function startGps(onFix, onErr) {
-  // Use Capacitor Geolocation on native platforms
-  if (isNative && window.Capacitor?.Plugins?.Geolocation) {
-    try {
-      const { Geolocation } = window.Capacitor.Plugins;
-      
-      // Request permission
-      const permStatus = await Geolocation.checkPermissions();
-      if (permStatus.location !== 'granted') {
-        const requested = await Geolocation.requestPermissions();
-        if (requested.location !== 'granted') {
-          onErr({ code: 1, message: 'Location permission denied' });
-          return () => {};
-        }
-      }
-      
-      // Watch position
-      const id = await Geolocation.watchPosition(
-        { enableHighAccuracy: true, timeout: 30000, maximumAge: 0 },
-        (position) => {
-          if (position) {
-            // Convert Capacitor position format to standard format
-            onFix({
-              timestamp: position.timestamp,
-              coords: {
-                latitude: position.coords.latitude,
-                longitude: position.coords.longitude,
-                altitude: position.coords.altitude,
-                speed: position.coords.speed,
-                heading: position.coords.heading,
-                accuracy: position.coords.accuracy,
-              }
-            });
-          }
-        }
-      );
-      return () => Geolocation.clearWatch({ id });
-    } catch (err) {
-      console.error('Capacitor Geolocation error:', err);
-      onErr({ code: 2, message: err.message });
-      return () => {};
-    }
-  }
-  
-  // Fall back to web geolocation API
-  if (!('geolocation' in navigator)) { 
-    onErr({ code: 0, message: 'Geolocation not available' }); 
-    return () => {}; 
-  }
-  const id = navigator.geolocation.watchPosition(onFix, onErr, { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 });
-  return () => navigator.geolocation.clearWatch(id);
-}
-
-// Demo mode: a racetrack-ish circle near KMTN, climbing to 3,000 ft at 95 kt.
-function startSim(onFix, start) {
-  const [lat0, lon0] = DEMO_ORIGIN, R = 2.5, GS = 95;
-  const step = () => {
-    const ms = Date.now(), el = ms / 1000 - start, ang = (el * GS) / 3600 / R;
-    onFix({
-      timestamp: ms,
-      coords: {
-        latitude: lat0 + (R * Math.sin(ang)) / 60,
-        longitude: lon0 + (R * (1 - Math.cos(ang))) / (60 * Math.cos((lat0 * Math.PI) / 180)),
-        altitude: Math.min(3000, 30 + el * 12) / M2FT,
-        speed: GS / MS2KT,
-        heading: ((ang * 180) / Math.PI) % 360,
-        accuracy: 5,
-      },
-    });
-  };
-  step();
-  const id = setInterval(step, 1000);
-  return () => clearInterval(id);
-}
-
-let wakeLock = null;
-async function keepAwake() {
-  try {
-    if ('wakeLock' in navigator && document.visibilityState === 'visible' && !wakeLock) {
-      wakeLock = await navigator.wakeLock.request('screen');
-      wakeLock.addEventListener('release', () => { wakeLock = null; });
-    }
-  } catch {}
-}
-
 function viewFly() {
   const p = profile();
   const a = store.get('active');
   const save = () => store.set('active', a);
-  const live = { fix: null, trk: null, gpsErr: null, hiddenAt: 0, gap: false, adsb: null, apiOk: null };
-  const useGps = p.demo || p.gps !== false;
+  const live = { adsb: null, apiOk: null, lastAdsbSeen: 0 };
 
   app.innerHTML = `
     <div class="map-screen">
       <div class="map" id="map"></div>
       <div class="overlay-top">
-        <div class="pill"><span class="status idle" id="st"><i></i>GPS</span><span class="mono">${esc(a.tail)}</span></div>
+        <div class="pill"><span class="status idle" id="st"><i></i>Transponder</span><span class="mono">${esc(a.tail)}</span></div>
         <div class="pill mono" id="elapsed">0:00</div>
       </div>
       <div class="map-tools" style="top:calc(var(--safe-top) + 64px)">
         <button class="icon-btn" id="layers" aria-label="Map style">${I.layers}</button>
-        <button class="icon-btn is-on" id="follow" aria-label="Follow my position">${I.locate}</button>
+        <button class="icon-btn is-on" id="follow" aria-label="Follow aircraft">${I.locate}</button>
       </div>
       <div class="panel">
         <div class="stats">
@@ -656,7 +570,7 @@ function viewFly() {
           <div class="stat"><small>Trk</small><b id="s-trk">—</b></div>
           <div class="stat"><small>Dist</small><b id="s-dist">—</b></div>
         </div>
-        <div class="sources"><span class="src" id="src-adsb"></span><span class="src" id="src-gps"></span></div>
+        <div class="sources"><span class="src" id="src-adsb"></span></div>
         <div id="banner"></div>
         <div class="btn-row">
           <button class="btn" id="share">${I.share}Share live link</button>
@@ -683,7 +597,7 @@ function viewFly() {
   $('#follow').onclick = () => {
     follow = true;
     $('#follow').classList.add('is-on');
-    if (live.fix) map.setView(live.fix.ll, Math.max(map.getZoom(), 12));
+    if (live.adsb) map.setView([live.adsb.lat, live.adsb.lon], Math.max(map.getZoom(), 12));
   };
   $('#layers').onclick = () => map.cycleLayer();
   $('#share').onclick = () => share(`${p.name} is flying`, `Follow my flight in ${a.tail} live:`, trackUrl(p));
@@ -692,64 +606,45 @@ function viewFly() {
     if (ok) endFlight();
   };
 
-  function onFix(pos) {
-    const c = pos.coords;
-    const ll = [c.latitude, c.longitude];
-    const prev = live.fix;
-    let gs = num(c.speed) != null ? c.speed * MS2KT : null;
-    let trk = num(c.heading);
-    if (prev) {
-      const d = nmBetween(prev.ll, ll), dt = (pos.timestamp - prev.ms) / 1000;
-      if (gs == null && dt > 0) gs = (d / dt) * 3600;
-      if (trk == null && d > 0.003) trk = bearing(prev.ll, ll);
-    }
-    if (trk != null && (gs == null || gs > 3)) live.trk = trk;
-    const alt = num(c.altitude) != null ? c.altitude * M2FT : null;
-    live.fix = { ll, ms: pos.timestamp, gs, alt, acc: c.accuracy };
-    live.gpsErr = null;
-    if (alt != null) a.maxAlt = Math.max(a.maxAlt || 0, alt);
-
-    const t = Math.floor(pos.timestamp / 1000);
-    if (t - a.lastT >= SAMPLE_SEC) {
-      const prevPt = a.track[a.track.length - 1];
-      if (prevPt && c.accuracy <= 60) a.dist += nmBetween([prevPt[1], prevPt[2]], ll);
-      const pt = [t, +ll[0].toFixed(5), +ll[1].toFixed(5), alt == null ? null : Math.round(alt), gs == null ? null : Math.round(gs), live.trk == null ? null : Math.round(live.trk)];
-      a.lastT = t;
-      a.buf.push(pt);
-      a.track.push(pt);
-      trail.addLatLng(ll);
-      if (a.track.length === 1) L.marker(ll, { icon: dotIcon(a.color), interactive: false }).addTo(map);
-      save();
-      if (a.track.length === 1) flush(); // watchers see the plane right away
-    }
-
-    placeMarker(ll, live.trk);
-    paint();
-  }
-
-  // Transponder (ADS-B) status from the server; also moves the marker when phone GPS is off or quiet.
+  // Transponder (ADS-B) polling - primary tracking mechanism
   async function pollAdsb() {
     const r = await apiGet(adsbUrl(a.tail, a.start));
     live.apiOk = !!r;
     live.adsb = r?.ac && r.ac.t >= a.start - 120 ? r.ac : null;
     const ad = live.adsb;
-    if (ad && now() - ad.t < ADSB_FRESH && (!live.fix || Date.now() - live.fix.ms > 30000)) {
-      if (live.lastAd && ad.t > live.lastAd.t && !ad.ground) a.dist += nmBetween([live.lastAd.lat, live.lastAd.lon], [ad.lat, ad.lon]);
+    
+    if (ad && now() - ad.t < ADSB_FRESH) {
+      live.lastAdsbSeen = now();
+      // Update distance tracking
+      if (live.lastAd && ad.t > live.lastAd.t && !ad.ground) {
+        a.dist += nmBetween([live.lastAd.lat, live.lastAd.lon], [ad.lat, ad.lon]);
+      }
+      // Update max altitude
+      if (ad.alt != null && !ad.ground) {
+        a.maxAlt = Math.max(a.maxAlt || 0, ad.alt);
+      }
       live.lastAd = ad;
       save();
       placeMarker([ad.lat, ad.lon], ad.trk);
+      
+      // Add track point if enough time has passed
+      const lastPt = a.track[a.track.length - 1];
+      if (!lastPt || ad.t - lastPt[0] >= MIN_STEP) {
+        const pt = [ad.t, +ad.lat.toFixed(5), +ad.lon.toFixed(5), 
+                     ad.alt == null || ad.ground ? 0 : Math.round(ad.alt), 
+                     ad.gs == null ? null : Math.round(ad.gs), 
+                     ad.trk == null ? null : Math.round(ad.trk)];
+        a.track.push(pt);
+        trail.addLatLng([ad.lat, ad.lon]);
+        if (a.track.length === 1) L.marker([ad.lat, ad.lon], { icon: dotIcon(a.color), interactive: false }).addTo(map);
+        save();
+      }
     }
     paint();
   }
 
-  function onGpsErr(err) {
-    live.gpsErr = err.code === 1 ? 'denied' : err.code === 0 ? 'unsupported' : 'searching';
-    paint();
-  }
-
   function flush() {
-    while (a.buf.length) outbox.add({ topic: dataTopic(p.channel), body: { k: 'p', f: a.fid, p: a.buf.splice(0, MAX_PTS) } });
-    save();
+    // Transponder-only: no buffered GPS points to flush
     outbox.flush().then(paint);
   }
 
