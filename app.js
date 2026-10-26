@@ -256,6 +256,43 @@ function apiPost(p, body) {
 }
 const adsbUrl = (tail, since) => `/ac/${encodeURIComponent(tail)}?since=${since}`;
 
+/* ---------- Polyline smoothing (Catmull-Rom) ---------- */
+// Smooth a polyline using Catmull-Rom interpolation for curved trails
+function smoothPolyline(points, segments = 10) {
+  if (points.length < 2) return points;
+  
+  const smooth = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    const p0 = points[Math.max(0, i - 1)];
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    const p3 = points[Math.min(points.length - 1, i + 2)];
+    
+    for (let t = 0; t < segments; t++) {
+      const u = t / segments;
+      const u2 = u * u;
+      const u3 = u2 * u;
+      
+      // Catmull-Rom formula
+      const lat = 0.5 * (
+        2 * p1[0] +
+        (-p0[0] + p2[0]) * u +
+        (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * u2 +
+        (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * u3
+      );
+      const lon = 0.5 * (
+        2 * p1[1] +
+        (-p0[1] + p2[1]) * u +
+        (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * u2 +
+        (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * u3
+      );
+      smooth.push([lat, lon]);
+    }
+  }
+  smooth.push(points[points.length - 1]);
+  return smooth;
+}
+
 /* ---------- Map ---------- */
 function makeMap(el, center = DEMO_ORIGIN, zoom = 10) {
   const dark = matchMedia('(prefers-color-scheme: dark)').matches;
@@ -581,61 +618,65 @@ function viewFly() {
 
   const last = a.track[a.track.length - 1];
   const map = makeMap($('#map'), last ? [last[1], last[2]] : DEMO_ORIGIN, last ? 13 : 10);
-  const trail = L.polyline(a.track.map((q) => [q[1], q[2]]), { 
+  
+  // Use smoothed trail for curved appearance
+  const rawPoints = a.track.map((q) => [q[1], q[2]]);
+  const smoothPoints = rawPoints.length > 2 ? smoothPolyline(rawPoints, 8) : rawPoints;
+  const trail = L.polyline(smoothPoints, { 
     color: a.color, weight: 4, opacity: 0.9, lineCap: 'round', lineJoin: 'round' 
   }).addTo(map);
   if (a.track[0]) L.marker([a.track[0][1], a.track[0][2]], { icon: dotIcon(a.color), interactive: false }).addTo(map);
+  
   let marker = null;
   let follow = true;
   let centered = !!last;
   
-  // Smooth marker animation
+  // Dead-reckoning animation state
   let animFrame = null;
-  let targetPos = null;
-  let currentPos = null;
+  let lastFix = null;
+  let lastFixTime = null;
   
-  const placeMarker = (ll, trk) => {
+  const placeMarker = (ll, trk, gs) => {
+    const now = Date.now();
+    lastFix = { lat: ll[0], lon: ll[1], trk, gs: gs || 0 };
+    lastFixTime = now;
+    
     if (!marker) {
       marker = L.marker(ll, { icon: planeIcon(a.color, trk, true), interactive: false, zIndexOffset: 1000 }).addTo(map);
-      currentPos = ll;
     } else {
-      targetPos = ll;
       marker.setIcon(planeIcon(a.color, trk, true));
-      
-      // Smoothly animate to new position over 3 seconds
-      if (!animFrame && currentPos) {
-        const startPos = currentPos;
-        const startTime = Date.now();
-        const duration = 3000;
-        
-        const animate = () => {
-          const elapsed = Date.now() - startTime;
-          const t = Math.min(elapsed / duration, 1);
-          // Ease-out interpolation
-          const ease = 1 - Math.pow(1 - t, 3);
-          
-          const lat = startPos[0] + (targetPos[0] - startPos[0]) * ease;
-          const lon = startPos[1] + (targetPos[1] - startPos[1]) * ease;
-          const pos = [lat, lon];
-          
-          marker.setLatLng(pos);
-          currentPos = pos;
-          
-          if (t < 1) {
-            animFrame = requestAnimationFrame(animate);
-          } else {
-            animFrame = null;
-            currentPos = targetPos;
-          }
-        };
-        
-        animate();
-      }
     }
     
     if (!centered) { map.setView(ll, 13); centered = true; }
     else if (follow) map.panTo(ll, { animate: true });
   };
+  
+  // Continuous dead-reckoning animation
+  const deadReckon = () => {
+    if (lastFix && lastFixTime) {
+      const elapsed = (Date.now() - lastFixTime) / 1000; // seconds
+      if (elapsed < 5 && lastFix.gs > 5) { // Only dead-reckon if moving and recent fix
+        // Calculate distance traveled: groundspeed (knots) * time (seconds) / 3600 * 60 = nautical miles
+        const nmTraveled = (lastFix.gs * elapsed) / 3600;
+        // Convert to degrees (rough approximation: 1nm ≈ 1/60 degree)
+        const radHeading = (lastFix.trk || 0) * Math.PI / 180;
+        const dLat = (nmTraveled / 60) * Math.cos(radHeading);
+        const dLon = (nmTraveled / 60) * Math.sin(radHeading) / Math.cos(lastFix.lat * Math.PI / 180);
+        
+        const projLat = lastFix.lat + dLat;
+        const projLon = lastFix.lon + dLon;
+        
+        if (marker) {
+          marker.setLatLng([projLat, projLon]);
+          if (follow && elapsed > 0.5) map.panTo([projLat, projLon], { animate: false });
+        }
+      }
+    }
+    animFrame = requestAnimationFrame(deadReckon);
+  };
+  
+  deadReckon(); // Start animation loop
+  cleanup.push(() => { if (animFrame) cancelAnimationFrame(animFrame); });
 
   map.on('dragstart', () => { follow = false; $('#follow').classList.remove('is-on'); });
   $('#follow').onclick = () => {
@@ -669,18 +710,24 @@ function viewFly() {
       }
       live.lastAd = ad;
       save();
-      placeMarker([ad.lat, ad.lon], ad.trk);
+      placeMarker([ad.lat, ad.lon], ad.trk, ad.gs);
       
-      // Add every transponder update to track (no throttling)
+      // Only add point if position actually changed (dedupe identical samples)
       const lastPt = a.track[a.track.length - 1];
-      if (!lastPt || ad.t > lastPt[0]) {
-        const pt = [ad.t, +ad.lat.toFixed(5), +ad.lon.toFixed(5), 
+      const lat = +ad.lat.toFixed(5), lon = +ad.lon.toFixed(5);
+      if (!lastPt || lastPt[1] !== lat || lastPt[2] !== lon) {
+        const pt = [ad.t, lat, lon, 
                      ad.alt == null || ad.ground ? 0 : Math.round(ad.alt), 
                      ad.gs == null ? null : Math.round(ad.gs), 
                      ad.trk == null ? null : Math.round(ad.trk)];
         a.track.push(pt);
-        trail.addLatLng([ad.lat, ad.lon]);
-        if (a.track.length === 1) L.marker([ad.lat, ad.lon], { icon: dotIcon(a.color), interactive: false }).addTo(map);
+        
+        // Update smoothed trail
+        const rawPoints = a.track.map((q) => [q[1], q[2]]);
+        const smoothPoints = rawPoints.length > 2 ? smoothPolyline(rawPoints, 8) : rawPoints;
+        trail.setLatLngs(smoothPoints);
+        
+        if (a.track.length === 1) L.marker([lat, lon], { icon: dotIcon(a.color), interactive: false }).addTo(map);
         save();
       }
     }
@@ -780,7 +827,7 @@ function viewFly() {
   apiPost('/track', { tail: a.tail });
   pollAdsb();
   const register = setInterval(() => apiPost('/track', { tail: a.tail }), 5 * 60 * 1000);
-  const adsbTimer = setInterval(pollAdsb, 3000);
+  const adsbTimer = setInterval(pollAdsb, 1000);
 
   const flushTimer = setInterval(flush, (p.interval || 30) * 1000);
   const clock = setInterval(paint, 1000);
@@ -839,9 +886,37 @@ function viewTrack(ch, nameHint) {
   const map = makeMap($('#map'), DEMO_ORIGIN, 9);
   const trail = L.polyline([], { weight: 4, opacity: 0.9, lineCap: 'round', lineJoin: 'round' }).addTo(map);
   let marker = null, startMarker = null;
+  
+  // Dead-reckoning animation state
   let animFrame = null;
-  let targetPos = null;
-  let currentPos = null;
+  let lastFix = null;
+  let lastFixTime = null;
+  
+  // Continuous dead-reckoning animation
+  const deadReckon = () => {
+    if (lastFix && lastFixTime) {
+      const elapsed = (Date.now() - lastFixTime) / 1000; // seconds
+      if (elapsed < 5 && lastFix.gs > 5) { // Only dead-reckon if moving and recent fix
+        // Calculate distance traveled
+        const nmTraveled = (lastFix.gs * elapsed) / 3600;
+        const radHeading = (lastFix.trk || 0) * Math.PI / 180;
+        const dLat = (nmTraveled / 60) * Math.cos(radHeading);
+        const dLon = (nmTraveled / 60) * Math.sin(radHeading) / Math.cos(lastFix.lat * Math.PI / 180);
+        
+        const projLat = lastFix.lat + dLat;
+        const projLon = lastFix.lon + dLon;
+        
+        if (marker) {
+          marker.setLatLng([projLat, projLon]);
+          if (follow && elapsed > 0.5) map.panTo([projLat, projLon], { animate: false });
+        }
+      }
+    }
+    animFrame = requestAnimationFrame(deadReckon);
+  };
+  
+  deadReckon(); // Start animation loop
+  cleanup.push(() => { if (animFrame) cancelAnimationFrame(animFrame); });
   map.on('dragstart', () => { follow = false; $('#follow').classList.remove('is-on'); });
   $('#layers').onclick = () => map.cycleLayer();
   $('#follow').onclick = () => {
@@ -915,52 +990,26 @@ function viewTrack(ch, nameHint) {
     if (!pts.length) return;
     const color = f.color || COLORS[0];
     const lls = pts.map((q) => [q[1], q[2]]);
+    
+    // Smooth the trail
+    const smoothLls = lls.length > 2 ? smoothPolyline(lls, 8) : lls;
+    
     const lastPt = pts[pts.length - 1];
     const here = [lastPt[1], lastPt[2]];
     const st = statusOf(f);
     trail.setStyle({ color });
-    trail.setLatLngs(lls);
+    trail.setLatLngs(smoothLls);
     const icon = planeIcon(color, lastPt[5], st === 'live');
+    
+    // Update dead-reckoning state
+    lastFix = { lat: here[0], lon: here[1], trk: lastPt[5], gs: lastPt[4] || 0 };
+    lastFixTime = Date.now();
     
     if (!marker) {
       marker = L.marker(here, { icon, interactive: false, zIndexOffset: 1000 }).addTo(map);
-      currentPos = here;
     } else {
-      targetPos = here;
+      marker.setLatLng(here);
       marker.setIcon(icon);
-      
-      // Smoothly animate to new position over 3 seconds
-      if (!animFrame && currentPos && (targetPos[0] !== currentPos[0] || targetPos[1] !== currentPos[1])) {
-        const startPos = currentPos;
-        const startTime = Date.now();
-        const duration = 3000;
-        
-        const animate = () => {
-          const elapsed = Date.now() - startTime;
-          const t = Math.min(elapsed / duration, 1);
-          // Ease-out interpolation
-          const ease = 1 - Math.pow(1 - t, 3);
-          
-          const lat = startPos[0] + (targetPos[0] - startPos[0]) * ease;
-          const lon = startPos[1] + (targetPos[1] - startPos[1]) * ease;
-          const pos = [lat, lon];
-          
-          marker.setLatLng(pos);
-          currentPos = pos;
-          
-          if (t < 1) {
-            animFrame = requestAnimationFrame(animate);
-          } else {
-            animFrame = null;
-            currentPos = targetPos;
-          }
-        };
-        
-        animate();
-      } else if (!animFrame) {
-        marker.setLatLng(here);
-        currentPos = here;
-      }
     }
     
     if (!startMarker) startMarker = L.marker(lls[0], { icon: dotIcon(color), interactive: false }).addTo(map);
@@ -1043,7 +1092,7 @@ function viewTrack(ch, nameHint) {
     adsbBusy = true;
     try { await pollAdsb(); } finally { adsbBusy = false; }
   };
-  const adsbTimer = setInterval(adsbTick, 3000);
+  const adsbTimer = setInterval(adsbTick, 1000);
   const adsbFirst = setTimeout(adsbTick, 1500); // after the ntfy backlog tells us the tail number
   cleanup.push(() => { es.close(); clearInterval(tick); clearInterval(adsbTimer); clearTimeout(adsbFirst); clearTimeout(pending); });
   renderPanel();

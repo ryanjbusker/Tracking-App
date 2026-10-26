@@ -23,9 +23,9 @@ const APNS_TEAM_ID = process.env.APNS_TEAM_ID;
 const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID;
 const APNS_KEY = process.env.APNS_KEY; // .p8 file contents
 const APNS_ENV = process.env.APNS_ENV || 'production'; // 'sandbox' or 'production'
-const POLL_MS = 3000;              // how often each active tail is polled
-const CACHE_MS = 2000;             // cache feed results to avoid hammering APIs
-const MIN_STEP = 0;                // store every point (no throttling)
+const POLL_MS = 1000;              // how often each active tail is polled (Flightradar-like)
+const CACHE_MS = 800;              // cache feed results to avoid hammering APIs
+const MIN_STEP = 0;                // store every point when position changes
 const KEEP_SEC = 8 * 3600;         // how much track history to keep in memory
 const PILOT_TTL = 5 * 3600;        // a started flight is polled for up to 5 h unless ended
 const WATCH_TTL = 10 * 60;         // a watcher keeps a tail polled for 10 min after its last request
@@ -320,9 +320,11 @@ async function poll(tail) {
     hex: ac.hex, type: ac.t || null, desc: ac.desc || null, squawk: ac.squawk || null,
     t, lat: ac.lat, lon: ac.lon, alt, ground, gs, trk,
   };
+  // Only store point if position actually changed (dedupe identical feed samples)
   const last = e.track[e.track.length - 1];
-  if (!last || t - last[0] >= MIN_STEP) {
-    e.track.push([t, +ac.lat.toFixed(5), +ac.lon.toFixed(5), alt == null ? null : Math.round(alt), gs == null ? null : Math.round(gs), trk == null ? null : Math.round(trk)]);
+  const lat = +ac.lat.toFixed(5), lon = +ac.lon.toFixed(5);
+  if (!last || last[1] !== lat || last[2] !== lon) {
+    e.track.push([t, lat, lon, alt == null ? null : Math.round(alt), gs == null ? null : Math.round(gs), trk == null ? null : Math.round(trk)]);
   }
   const cutoff = now() - KEEP_SEC;
   while (e.track.length && e.track[0][0] < cutoff) e.track.shift();
