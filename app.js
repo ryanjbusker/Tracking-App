@@ -608,6 +608,10 @@ function viewFly() {
           <div class="stat"><small>Dist</small><b id="s-dist">—</b></div>
         </div>
         <div class="sources"><span class="src" id="src-adsb"></span></div>
+        <div id="traffic-indicator" style="margin:8px 0;padding:8px;background:rgba(0,0,0,0.05);border-radius:8px;font-size:13px;display:none;">
+          <div style="font-weight:600;margin-bottom:4px;">Nearest Traffic</div>
+          <div id="traffic-text" style="color:#666;"></div>
+        </div>
         <div id="banner"></div>
         <div class="btn-row">
           <button class="btn" id="share">${I.share}Share live link</button>
@@ -630,6 +634,11 @@ function viewFly() {
   let marker = null;
   let follow = true;
   let centered = !!last;
+  
+  // Traffic display
+  let trafficMarkers = [];
+  let nearestLine = null;
+  let traffic = { nearest: null, all: [] };
   
   // Dead-reckoning animation state
   let animFrame = null;
@@ -734,6 +743,72 @@ function viewFly() {
     paint();
   }
 
+  async function pollTraffic() {
+    if (!live.adsb || now() - live.adsb.t >= ADSB_FRESH) {
+      traffic = { nearest: null, all: [] };
+      updateTrafficDisplay();
+      return;
+    }
+    
+    const r = await apiGet(`/traffic/${encodeURIComponent(a.tail)}`);
+    if (r) {
+      traffic.nearest = r.nearest;
+      traffic.all = r.traffic || [];
+      updateTrafficDisplay();
+      updateTrafficMarkers();
+    }
+  }
+  
+  function updateTrafficDisplay() {
+    const indicator = $('#traffic-indicator');
+    const text = $('#traffic-text');
+    
+    if (!traffic.nearest) {
+      indicator.style.display = 'block';
+      text.innerHTML = '<span style="color:#999;">No traffic within 10 nm</span>';
+      return;
+    }
+    
+    const t = traffic.nearest;
+    const id = t.callsign || t.tail || 'Unknown';
+    const distStr = t.dist.toFixed(1);
+    const clock = t.clock ? `${t.clock} o'clock` : t.cardinal;
+    const altStr = t.relAlt > 0 ? `+${Math.round(t.relAlt)}` : Math.round(t.relAlt);
+    const vsIcon = t.vs > 100 ? ' ↑' : t.vs < -100 ? ' ↓' : '';
+    
+    indicator.style.display = 'block';
+    text.innerHTML = `<b>${id}</b> ${distStr} nm, ${clock}, ${altStr} ft${vsIcon}`;
+  }
+  
+  function updateTrafficMarkers() {
+    // Clear old markers
+    trafficMarkers.forEach(m => map.removeLayer(m));
+    trafficMarkers = [];
+    if (nearestLine) { map.removeLayer(nearestLine); nearestLine = null; }
+    
+    if (!traffic.all.length || !live.adsb) return;
+    
+    // Draw nearest with dashed line
+    if (traffic.nearest) {
+      const n = traffic.nearest;
+      nearestLine = L.polyline([
+        [live.adsb.lat, live.adsb.lon],
+        [n.lat, n.lon]
+      ], { color: '#f59e0b', weight: 2, dashArray: '5, 5', opacity: 0.6 }).addTo(map);
+      
+      const icon = planeIcon('#f59e0b', n.trk, true);
+      const m = L.marker([n.lat, n.lon], { icon, interactive: false, zIndexOffset: 500 }).addTo(map);
+      trafficMarkers.push(m);
+    }
+    
+    // Draw other traffic as faint icons
+    traffic.all.slice(1, 10).forEach((t) => {
+      const icon = planeIcon('#999', t.trk, false);
+      const m = L.marker([t.lat, t.lon], { icon, interactive: false, zIndexOffset: 100, opacity: 0.4 }).addTo(map);
+      trafficMarkers.push(m);
+    });
+  }
+
   function flush() {
     // Transponder-only: no buffered GPS points to flush
     outbox.flush().then(paint);
@@ -828,10 +903,20 @@ function viewFly() {
   pollAdsb();
   const register = setInterval(() => apiPost('/track', { tail: a.tail }), 5 * 60 * 1000);
   const adsbTimer = setInterval(pollAdsb, 1000);
+  
+  // Poll traffic every 3 seconds
+  pollTraffic();
+  const trafficTimer = setInterval(pollTraffic, 3000);
 
   const flushTimer = setInterval(flush, (p.interval || 30) * 1000);
   const clock = setInterval(paint, 1000);
-  cleanup.push(() => { clearInterval(flushTimer); clearInterval(clock); clearInterval(register); clearInterval(adsbTimer); });
+  cleanup.push(() => { 
+    clearInterval(flushTimer); 
+    clearInterval(clock); 
+    clearInterval(register); 
+    clearInterval(adsbTimer); 
+    clearInterval(trafficTimer);
+  });
 
   if (!a.announced) {
     // Send via native push if available, otherwise ntfy.sh
@@ -886,6 +971,11 @@ function viewTrack(ch, nameHint) {
   const map = makeMap($('#map'), DEMO_ORIGIN, 9);
   const trail = L.polyline([], { weight: 4, opacity: 0.9, lineCap: 'round', lineJoin: 'round' }).addTo(map);
   let marker = null, startMarker = null;
+  
+  // Traffic display
+  let trafficMarkers = [];
+  let nearestLine = null;
+  let watchTraffic = { nearest: null, all: [] };
   
   // Dead-reckoning animation state
   let animFrame = null;
@@ -984,6 +1074,52 @@ function viewTrack(ch, nameHint) {
     schedule();
   }
 
+  async function pollWatchTraffic() {
+    const f = latest();
+    if (!f || !f.tail || !f.ac || !f.ac.visible) {
+      watchTraffic = { nearest: null, all: [] };
+      updateWatchTrafficMarkers();
+      return;
+    }
+    
+    const r = await apiGet(`/traffic/${encodeURIComponent(f.tail)}`);
+    if (r) {
+      watchTraffic.nearest = r.nearest;
+      watchTraffic.all = r.traffic || [];
+      updateWatchTrafficMarkers();
+    }
+  }
+  
+  function updateWatchTrafficMarkers() {
+    // Clear old markers
+    trafficMarkers.forEach(m => map.removeLayer(m));
+    trafficMarkers = [];
+    if (nearestLine) { map.removeLayer(nearestLine); nearestLine = null; }
+    
+    const f = latest();
+    if (!watchTraffic.all.length || !f || !f.ac) return;
+    
+    // Draw nearest with dashed line
+    if (watchTraffic.nearest) {
+      const n = watchTraffic.nearest;
+      nearestLine = L.polyline([
+        [f.ac.lat, f.ac.lon],
+        [n.lat, n.lon]
+      ], { color: '#f59e0b', weight: 2, dashArray: '5, 5', opacity: 0.6 }).addTo(map);
+      
+      const icon = planeIcon('#f59e0b', n.trk, true);
+      const m = L.marker([n.lat, n.lon], { icon, interactive: false, zIndexOffset: 500 }).addTo(map);
+      trafficMarkers.push(m);
+    }
+    
+    // Draw other traffic as faint icons
+    watchTraffic.all.slice(1, 10).forEach((t) => {
+      const icon = planeIcon('#999', t.trk, false);
+      const m = L.marker([t.lat, t.lon], { icon, interactive: false, zIndexOffset: 100, opacity: 0.4 }).addTo(map);
+      trafficMarkers.push(m);
+    });
+  }
+
   function drawMap() {
     const f = latest();
     const pts = f ? track(f) : [];
@@ -1062,6 +1198,10 @@ function viewTrack(ch, nameHint) {
           <div class="stat"><small>Hdg</small><b>${pt?.[5] != null ? fmtHdg(pt[5]) + '°' : '—'}</b></div>
           <div class="stat"><small>Time</small><b>${fmtDur(dur).replace(/:\d\d$/, (m) => (dur >= 3600 ? '' : m))}</b></div>
         </div>
+        ${watchTraffic.nearest ? `<div style="margin:8px 0;padding:8px;background:rgba(0,0,0,0.05);border-radius:8px;font-size:13px;">
+          <div style="font-weight:600;margin-bottom:4px;">Nearest Traffic</div>
+          <div style="color:#666;"><b>${esc(watchTraffic.nearest.callsign || watchTraffic.nearest.tail || 'Unknown')}</b> ${watchTraffic.nearest.dist.toFixed(1)} nm, ${watchTraffic.nearest.clock ? watchTraffic.nearest.clock + ' o\'clock' : watchTraffic.nearest.cardinal}, ${watchTraffic.nearest.relAlt > 0 ? '+' : ''}${Math.round(watchTraffic.nearest.relAlt)} ft${watchTraffic.nearest.vs > 100 ? ' ↑' : watchTraffic.nearest.vs < -100 ? ' ↓' : ''}</div>
+        </div>` : st === 'live' ? `<div style="margin:8px 0;padding:8px;background:rgba(0,0,0,0.05);border-radius:8px;font-size:13px;color:#999;">No traffic within 10 nm</div>` : ''}
         <div class="panel-foot"><span>${foot}</span><span>${dist.toFixed(dist < 10 ? 1 : 0)} nm flown</span></div>
         ${connected ? '' : `<div class="banner">${I.alert}<span>Reconnecting…</span></div>`}`;
     }
@@ -1094,7 +1234,19 @@ function viewTrack(ch, nameHint) {
   };
   const adsbTimer = setInterval(adsbTick, 1000);
   const adsbFirst = setTimeout(adsbTick, 1500); // after the ntfy backlog tells us the tail number
-  cleanup.push(() => { es.close(); clearInterval(tick); clearInterval(adsbTimer); clearTimeout(adsbFirst); clearTimeout(pending); });
+  
+  // Poll traffic every 3 seconds
+  pollWatchTraffic();
+  const trafficTimer = setInterval(pollWatchTraffic, 3000);
+  
+  cleanup.push(() => { 
+    es.close(); 
+    clearInterval(tick); 
+    clearInterval(adsbTimer); 
+    clearInterval(trafficTimer);
+    clearTimeout(adsbFirst); 
+    clearTimeout(pending); 
+  });
   renderPanel();
 }
 

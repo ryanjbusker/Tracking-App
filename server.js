@@ -257,6 +257,8 @@ const num = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
 const tails = new Map();
 // Cache feed results to avoid hammering APIs
 const feedCache = new Map(); // tail -> { data, fetchedAt }
+// Cache traffic results
+const trafficCache = new Map(); // tail -> { data, fetchedAt }
 
 function entry(tail) {
   let e = tails.get(tail);
@@ -330,6 +332,85 @@ async function poll(tail) {
   while (e.track.length && e.track[0][0] < cutoff) e.track.shift();
 }
 
+/* ---------- Nearby traffic ---------- */
+async function fetchTraffic(tail, lat, lon) {
+  // Check cache first (3s TTL for traffic)
+  const cacheKey = `${tail}:${lat.toFixed(3)}:${lon.toFixed(3)}`;
+  const cached = trafficCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < 3000) {
+    return cached.data;
+  }
+
+  const radius = 10; // nm
+  const urls = [
+    `https://api.adsb.lol/v2/point/${lat}/${lon}/${radius}`,
+    `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${radius}`,
+  ];
+
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) });
+      if (res.status === 429) continue; // Rate limited, try next
+      if (!res.ok) continue;
+      const data = await res.json();
+      
+      // Process aircraft list
+      const list = Array.isArray(data.ac) ? data.ac : [];
+      const aircraft = list
+        .filter((a) => {
+          const reg = (a.r || '').toUpperCase();
+          return reg && reg !== tail && num(a.lat) != null && num(a.lon) != null;
+        })
+        .map((a) => ({
+          tail: a.r?.toUpperCase() || null,
+          callsign: a.flight?.trim() || null,
+          lat: a.lat,
+          lon: a.lon,
+          alt: num(a.alt_baro) ?? num(a.alt_geom) ?? 0,
+          gs: num(a.gs) ?? 0,
+          trk: num(a.track) ?? num(a.true_heading) ?? 0,
+          vs: num(a.baro_rate) ?? 0,
+        }));
+      
+      // Cache successful result
+      trafficCache.set(cacheKey, { data: aircraft, fetchedAt: Date.now() });
+      return aircraft;
+    } catch {}
+  }
+  
+  return [];
+}
+
+function bearingTo(lat1, lon1, lat2, lon2) {
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const y = Math.sin(dLon) * Math.cos(lat2 * Math.PI / 180);
+  const x = Math.cos(lat1 * Math.PI / 180) * Math.sin(lat2 * Math.PI / 180) -
+            Math.sin(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.cos(dLon);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+function distanceNm(lat1, lon1, lat2, lon2) {
+  const R = 3440.065; // Earth radius in nautical miles
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+            Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function clockPosition(bearing, ownTrack) {
+  const relative = (bearing - ownTrack + 360) % 360;
+  const hour = Math.round(relative / 30);
+  return hour === 0 ? 12 : hour;
+}
+
+function cardinalDir(bearing) {
+  const dirs = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+  return dirs[Math.round(bearing / 22.5) % 16];
+}
+
 let polling = false;
 setInterval(async () => {
   if (polling) return;
@@ -375,6 +456,34 @@ async function api(req, res, url) {
     if (now() - e.lastPoll >= POLL_MS / 1000) await poll(tail);
     const since = Number(url.searchParams.get('since')) || 0;
     return json(res, 200, { tail, ac: e.ac, track: e.track.filter((p) => p[0] > since), feedOk: e.feedOk, polledAt: e.lastPoll });
+  }
+
+  // GET /api/traffic/:tail -> nearby traffic for this aircraft
+  if (req.method === 'GET' && parts[1] === 'traffic' && parts[2]) {
+    const tail = decodeURIComponent(parts[2]).toUpperCase();
+    if (!TAIL_RE.test(tail)) return json(res, 400, { error: 'bad tail' });
+    const e = entry(tail);
+    if (!e.ac || !e.ac.visible || num(e.ac.lat) == null || num(e.ac.lon) == null) {
+      return json(res, 200, { traffic: [], nearest: null });
+    }
+    
+    const traffic = await fetchTraffic(tail, e.ac.lat, e.ac.lon);
+    
+    // Calculate distances and bearings
+    const enriched = traffic.map((a) => {
+      const dist = distanceNm(e.ac.lat, e.ac.lon, a.lat, a.lon);
+      const bearing = bearingTo(e.ac.lat, e.ac.lon, a.lat, a.lon);
+      const relAlt = a.alt - (e.ac.alt || 0);
+      const clock = e.ac.trk != null ? clockPosition(bearing, e.ac.trk) : null;
+      const cardinal = cardinalDir(bearing);
+      return { ...a, dist, bearing, relAlt, clock, cardinal };
+    });
+    
+    // Sort by distance
+    enriched.sort((a, b) => a.dist - b.dist);
+    
+    const nearest = enriched[0] || null;
+    return json(res, 200, { traffic: enriched.slice(0, 10), nearest });
   }
 
   // POST /api/track {tail}  — pilot started a flight
