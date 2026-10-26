@@ -110,8 +110,8 @@ jobs:
                 targets: ["App"],
                 code_sign_identity: "iPhone Distribution",
                 bundle_identifier: "com.ryanbusker.contrail",
-                profile_name: ENV["sigh_com.ryanbusker.contrail_appstore_profile-name"],
-                team_id: ENV["APPLE_TEAM_ID"]
+                profile_name: "match AppStore com.ryanbusker.contrail",
+                team_id: "R6M54WJATS"
               )
 
               # Build the app
@@ -120,9 +120,10 @@ jobs:
                 scheme: "App",
                 configuration: "Release",
                 export_method: "app-store",
+                xcargs: "DEVELOPMENT_TEAM=R6M54WJATS",
                 export_options: {
                   provisioningProfiles: {
-                    "com.ryanbusker.contrail" => ENV["sigh_com.ryanbusker.contrail_appstore_profile-name"]
+                    "com.ryanbusker.contrail" => "match AppStore com.ryanbusker.contrail"
                   }
                 }
               )
