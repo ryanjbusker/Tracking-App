@@ -644,14 +644,43 @@ function viewFly() {
   let animFrame = null;
   let lastFix = null;
   let lastFixTime = null;
+  let lastFixId = null; // To detect duplicate fixes
   
-  const placeMarker = (ll, trk, gs) => {
-    const now = Date.now();
-    lastFix = { lat: ll[0], lon: ll[1], trk, gs: gs || 0 };
-    lastFixTime = now;
+  const placeMarker = (ll, trk, gs, fixTime, fixId) => {
+    // Don't update if this is a duplicate fix
+    if (fixId === lastFixId) return;
+    
+    const newFix = { lat: ll[0], lon: ll[1], trk, gs: gs || 0 };
+    const newFixTime = fixTime * 1000; // Convert to milliseconds
+    
+    // If we have a previous fix, check if new fix is behind predicted position
+    if (lastFix && lastFixTime && newFixTime > lastFixTime) {
+      const elapsed = (newFixTime - lastFixTime) / 1000;
+      if (elapsed < 5 && lastFix.gs > 5) {
+        // Calculate where we predicted the plane would be
+        const nmTraveled = (lastFix.gs * elapsed) / 3600;
+        const radHeading = (lastFix.trk || 0) * Math.PI / 180;
+        const dLat = (nmTraveled / 60) * Math.cos(radHeading);
+        const dLon = (nmTraveled / 60) * Math.sin(radHeading) / Math.cos(lastFix.lat * Math.PI / 180);
+        const predictedLat = lastFix.lat + dLat;
+        const predictedLon = lastFix.lon + dLon;
+        
+        // If new fix is behind prediction, blend instead of snapping
+        const distToPredicted = Math.sqrt(Math.pow(newFix.lat - predictedLat, 2) + Math.pow(newFix.lon - predictedLon, 2));
+        if (distToPredicted > 0.001) { // ~60m threshold
+          // Use predicted position as starting point for next extrapolation
+          newFix.lat = predictedLat;
+          newFix.lon = predictedLon;
+        }
+      }
+    }
+    
+    lastFix = newFix;
+    lastFixTime = newFixTime;
+    lastFixId = fixId;
     
     if (!marker) {
-      marker = L.marker(ll, { icon: planeIcon(a.color, trk, true), interactive: false, zIndexOffset: 1000 }).addTo(map);
+      marker = L.marker([newFix.lat, newFix.lon], { icon: planeIcon(a.color, trk, true), interactive: false, zIndexOffset: 1000 }).addTo(map);
     } else {
       marker.setIcon(planeIcon(a.color, trk, true));
     }
@@ -719,7 +748,7 @@ function viewFly() {
       }
       live.lastAd = ad;
       save();
-      placeMarker([ad.lat, ad.lon], ad.trk, ad.gs);
+      placeMarker([ad.lat, ad.lon], ad.trk, ad.gs, ad.t, `${ad.t}-${ad.lat}-${ad.lon}`);
       
       // Only add point if position actually changed (dedupe identical samples)
       const lastPt = a.track[a.track.length - 1];
@@ -745,23 +774,38 @@ function viewFly() {
 
   async function pollTraffic() {
     if (!live.adsb || now() - live.adsb.t >= ADSB_FRESH) {
-      traffic = { nearest: null, all: [] };
+      traffic = { nearest: null, all: [], error: null };
       updateTrafficDisplay();
       return;
     }
     
-    const r = await apiGet(`/traffic/${encodeURIComponent(a.tail)}`);
-    if (r) {
-      traffic.nearest = r.nearest;
-      traffic.all = r.traffic || [];
+    try {
+      const r = await apiGet(`/traffic/${encodeURIComponent(a.tail)}`);
+      if (r) {
+        traffic.nearest = r.nearest;
+        traffic.all = r.traffic || [];
+        traffic.error = null;
+        updateTrafficDisplay();
+        updateTrafficMarkers();
+      } else {
+        traffic.error = 'Traffic unavailable';
+        updateTrafficDisplay();
+      }
+    } catch (err) {
+      traffic.error = 'Traffic error';
       updateTrafficDisplay();
-      updateTrafficMarkers();
     }
   }
   
   function updateTrafficDisplay() {
     const indicator = $('#traffic-indicator');
     const text = $('#traffic-text');
+    
+    if (traffic.error) {
+      indicator.style.display = 'block';
+      text.innerHTML = `<span style="color:#f59e0b;">${traffic.error}</span>`;
+      return;
+    }
     
     if (!traffic.nearest) {
       indicator.style.display = 'block';
@@ -1137,9 +1181,15 @@ function viewTrack(ch, nameHint) {
     trail.setLatLngs(smoothLls);
     const icon = planeIcon(color, lastPt[5], st === 'live');
     
-    // Update dead-reckoning state
-    lastFix = { lat: here[0], lon: here[1], trk: lastPt[5], gs: lastPt[4] || 0 };
-    lastFixTime = Date.now();
+    // Update dead-reckoning state with actual fix time
+    const fixTime = lastPt[0] * 1000; // Convert to milliseconds
+    const fixId = `${lastPt[0]}-${lastPt[1]}-${lastPt[2]}`;
+    
+    // Only update if this is a new fix
+    if (fixId !== lastFix?.id) {
+      lastFix = { lat: here[0], lon: here[1], trk: lastPt[5], gs: lastPt[4] || 0, id: fixId };
+      lastFixTime = fixTime;
+    }
     
     if (!marker) {
       marker = L.marker(here, { icon, interactive: false, zIndexOffset: 1000 }).addTo(map);
