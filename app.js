@@ -9,7 +9,10 @@
 
 /* ---------- Config ---------- */
 const NTFY = 'https://ntfy.sh';
-const API = 'api';        // relative, served by server.js; missing on a static host and that's fine
+const API_BASE = typeof window.Capacitor !== 'undefined' && window.Capacitor.isNativePlatform?.() 
+  ? 'https://contrail-xnd3.onrender.com/api' 
+  : 'api';  // relative when on web, full URL for native
+const API = API_BASE;
 const ADSB_FRESH = 60;    // seconds an ADS-B position still counts as live
 const SAMPLE_SEC = 5;     // one track point every 5 s
 const MAX_PTS = 10;       // points per message, keeps each message small
@@ -226,11 +229,30 @@ window.addEventListener('online', () => outbox.flush());
 async function apiGet(p) {
   try {
     const r = await fetch(`${API}${p}`, { cache: 'no-store' });
-    return r.ok ? await r.json() : null;
-  } catch { return null; }
+    if (!r.ok) {
+      const errorMsg = `API error: ${r.status} ${r.statusText}`;
+      console.error(errorMsg, p);
+      toast(errorMsg, 5000);
+      return null;
+    }
+    return await r.json();
+  } catch (err) {
+    const errorMsg = `Network error: ${err.message}`;
+    console.error(errorMsg, p);
+    toast(errorMsg, 5000);
+    return null;
+  }
 }
 function apiPost(p, body) {
-  return fetch(`${API}${p}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => {});
+  return fetch(`${API}${p}`, { 
+    method: 'POST', 
+    headers: { 'Content-Type': 'application/json' }, 
+    body: JSON.stringify(body) 
+  }).catch((err) => {
+    const errorMsg = `Network error: ${err.message}`;
+    console.error(errorMsg, p);
+    toast(errorMsg, 5000);
+  });
 }
 const adsbUrl = (tail, since) => `/ac/${encodeURIComponent(tail)}?since=${since}`;
 
@@ -524,8 +546,55 @@ function startFlight(plane) {
   location.hash = '#/fly';
 }
 
-function startGps(onFix, onErr) {
-  if (!('geolocation' in navigator)) { onErr({ code: 0 }); return () => {}; }
+async function startGps(onFix, onErr) {
+  // Use Capacitor Geolocation on native platforms
+  if (isNative && window.Capacitor?.Plugins?.Geolocation) {
+    try {
+      const { Geolocation } = window.Capacitor.Plugins;
+      
+      // Request permission
+      const permStatus = await Geolocation.checkPermissions();
+      if (permStatus.location !== 'granted') {
+        const requested = await Geolocation.requestPermissions();
+        if (requested.location !== 'granted') {
+          onErr({ code: 1, message: 'Location permission denied' });
+          return () => {};
+        }
+      }
+      
+      // Watch position
+      const id = await Geolocation.watchPosition(
+        { enableHighAccuracy: true, timeout: 30000, maximumAge: 0 },
+        (position) => {
+          if (position) {
+            // Convert Capacitor position format to standard format
+            onFix({
+              timestamp: position.timestamp,
+              coords: {
+                latitude: position.coords.latitude,
+                longitude: position.coords.longitude,
+                altitude: position.coords.altitude,
+                speed: position.coords.speed,
+                heading: position.coords.heading,
+                accuracy: position.coords.accuracy,
+              }
+            });
+          }
+        }
+      );
+      return () => Geolocation.clearWatch({ id });
+    } catch (err) {
+      console.error('Capacitor Geolocation error:', err);
+      onErr({ code: 2, message: err.message });
+      return () => {};
+    }
+  }
+  
+  // Fall back to web geolocation API
+  if (!('geolocation' in navigator)) { 
+    onErr({ code: 0, message: 'Geolocation not available' }); 
+    return () => {}; 
+  }
   const id = navigator.geolocation.watchPosition(onFix, onErr, { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 });
   return () => navigator.geolocation.clearWatch(id);
 }
@@ -690,7 +759,7 @@ function viewFly() {
     const dur = end - a.start;
     
     // Send via native push if available, otherwise ntfy.sh
-    if (isNative && db) {
+    if (isNative) {
       apiPost('/flight/end', {
         channel: p.channel,
         tail: a.tail,
@@ -789,7 +858,7 @@ function viewFly() {
 
   if (!a.announced) {
     // Send via native push if available, otherwise ntfy.sh
-    if (isNative && db) {
+    if (isNative) {
       apiPost('/flight/start', {
         channel: p.channel,
         tail: a.tail,
