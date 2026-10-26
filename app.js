@@ -733,6 +733,7 @@ function viewFly() {
   async function pollAdsb() {
     const r = await apiGet(adsbUrl(a.tail, a.start));
     live.apiOk = !!r;
+    live.apiResp = r; // Store full response to check feedOk
     live.adsb = r?.ac && r.ac.t >= a.start - 120 ? r.ac : null;
     const ad = live.adsb;
     
@@ -908,7 +909,12 @@ function viewFly() {
     st.innerHTML = `<i></i>${{ idle: 'Searching', live: 'Live', stale: 'No signal' }[state]}`;
 
     const chip = (el, cls, text) => { el.className = `src ${cls}`; el.innerHTML = `<i></i>${text}`; };
-    if (live.apiOk === false) {
+    
+    // Show feed status prominently
+    const r = live.apiResp; // response from /api/ac
+    if (r && r.feedOk === false) {
+      chip($('#src-adsb'), 'warn', 'Feed unavailable, retrying…');
+    } else if (live.apiOk === false) {
       chip($('#src-adsb'), 'warn', 'Transponder: server unavailable');
     } else if (ad) {
       chip($('#src-adsb'), 'on', `Transponder · ${ago(ad.t)}`);

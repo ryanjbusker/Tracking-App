@@ -23,20 +23,33 @@ const APNS_TEAM_ID = process.env.APNS_TEAM_ID;
 const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID;
 const APNS_KEY = process.env.APNS_KEY; // .p8 file contents
 const APNS_ENV = process.env.APNS_ENV || 'production'; // 'sandbox' or 'production'
-const POLL_MS = 2000;              // server polls feeds every 2s to avoid 429s
-const CACHE_MS = 800;              // cache feed results to avoid hammering APIs
+const POLL_MS = 3000;              // server polls feeds every 3s (shared poller)
+const CACHE_MS = 2500;             // cache feed results (clients read from cache only)
 const MIN_STEP = 0;                // store every point when position changes
 const KEEP_SEC = 8 * 3600;         // how much track history to keep in memory
 const PILOT_TTL = 5 * 3600;        // a started flight is polled for up to 5 h unless ended
 const WATCH_TTL = 10 * 60;         // a watcher keeps a tail polled for 10 min after its last request
 const MAX_TAILS = 100;
 const UA = 'contrail-flight-tracker (+https://github.com/ryanjbusker/Tracking-App)';
-const FEEDS = [
-  (reg) => `https://api.adsb.lol/v2/reg/${reg}`,
-  (reg) => `https://opendata.adsb.fi/api/v2/registration/${reg}`,
-];
+
+// Multiple feed sources with per-host backoff
+const FEEDS = {
+  'adsb.lol': (reg) => `https://api.adsb.lol/v2/reg/${reg}`,
+  'adsb.fi': (reg) => `https://opendata.adsb.fi/api/v2/registration/${reg}`,
+  'airplanes.live': (reg) => `https://api.airplanes.live/v2/reg/${reg}`,
+};
+const feedBackoff = {}; // host -> backoffUntil timestamp
 
 const TAIL_RE = /^[A-Z0-9-]{2,8}$/;
+
+// Normalize tail number: uppercase, strip spaces/dashes, add N prefix for digits
+function normalizeTail(tail) {
+  if (!tail) return '';
+  let t = String(tail).toUpperCase().replace(/[\s-]/g, '');
+  // Add N prefix if starts with digit (common for US registrations)
+  if (/^\d/.test(t) && !t.startsWith('N')) t = 'N' + t;
+  return t;
+}
 
 /* ---------- Database ---------- */
 let db = null;
@@ -274,43 +287,84 @@ function entry(tail) {
 }
 
 async function fetchFeed(tail) {
-  // Check cache first (2s TTL)
+  // Check cache first
   const cached = feedCache.get(tail);
   if (cached && Date.now() - cached.fetchedAt < CACHE_MS) {
     return cached.data;
   }
 
-  for (const url of FEEDS) {
+  let lastError = null;
+  for (const [host, urlFn] of Object.entries(FEEDS)) {
+    // Check per-host backoff
+    if (feedBackoff[host] && Date.now() < feedBackoff[host]) {
+      console.log(`[${tail}] ${host} in backoff until ${new Date(feedBackoff[host]).toISOString()}`);
+      continue;
+    }
+
     try {
-      const res = await fetch(url(tail), { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) });
+      const url = urlFn(tail);
+      const res = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) });
+      
       if (res.status === 429) {
-        // Rate limited - back off for 10 seconds
-        const e = entry(tail);
-        e.backoffUntil = Date.now() + 10000;
-        return null;
+        const backoffMs = 30000; // 30s backoff on rate limit
+        feedBackoff[host] = Date.now() + backoffMs;
+        console.error(`[${tail}] ${host} rate limited (429), backing off 30s`);
+        lastError = `${host}: 429 rate limit`;
+        continue;
       }
-      if (!res.ok) continue;
+      
+      if (res.status === 403) {
+        const backoffMs = 60000; // 60s backoff on forbidden
+        feedBackoff[host] = Date.now() + backoffMs;
+        console.error(`[${tail}] ${host} forbidden (403), backing off 60s`);
+        lastError = `${host}: 403 forbidden`;
+        continue;
+      }
+      
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        console.error(`[${tail}] ${host} HTTP ${res.status}: ${text.slice(0, 100)}`);
+        lastError = `${host}: HTTP ${res.status}`;
+        continue;
+      }
+      
       const data = await res.json();
-      // Cache successful result
+      
+      // Success - cache and return
       feedCache.set(tail, { data, fetchedAt: Date.now() });
+      console.log(`[${tail}] ${host} OK, ${data.ac?.length || 0} aircraft`);
       return data;
-    } catch {}
+      
+    } catch (err) {
+      console.error(`[${tail}] ${host} error: ${err.message}`);
+      lastError = `${host}: ${err.message}`;
+    }
   }
+  
+  // All feeds failed
+  console.error(`[${tail}] All feeds failed. Last error: ${lastError}`);
   return null;
 }
 
 async function poll(tail) {
   const e = entry(tail);
-  // Respect backoff period
-  if (e.backoffUntil && Date.now() < e.backoffUntil) return;
   
   e.lastPoll = now();
   const data = await fetchFeed(tail);
   e.feedOk = !!data;
-  if (!data) return;
+  
+  // Keep last known position when feeds fail, mark as stale
+  if (!data) {
+    if (e.ac) e.ac.visible = false; // Mark as stale but keep position
+    return;
+  }
+  
   const list = Array.isArray(data.ac) ? data.ac : [];
   const ac = list.find((a) => (a.r || '').toUpperCase() === tail) || list[0];
-  if (!ac || num(ac.lat) == null || num(ac.lon) == null) { if (e.ac) e.ac.visible = false; return; }
+  if (!ac || num(ac.lat) == null || num(ac.lon) == null) { 
+    if (e.ac) e.ac.visible = false; 
+    return; 
+  }
 
   const feedNow = num(data.now) ? data.now / 1000 : Date.now() / 1000;
   const t = Math.round(feedNow - (num(ac.seen_pos) ?? num(ac.seen) ?? 0));
@@ -334,15 +388,17 @@ async function poll(tail) {
 
 /* ---------- Nearby traffic ---------- */
 async function fetchTraffic(tail, lat, lon) {
-  // Check cache first (3s TTL for traffic)
+  // Check cache first (10s TTL to reduce traffic queries)
   const cacheKey = `${tail}:${lat.toFixed(3)}:${lon.toFixed(3)}`;
   const cached = trafficCache.get(cacheKey);
-  if (cached && Date.now() - cached.fetchedAt < 3000) {
+  if (cached && Date.now() - cached.fetchedAt < 10000) {
     return cached.data;
   }
 
   const radius = 10; // nm
+  // Use airplanes.live first (different host than position polling)
   const urls = [
+    `https://api.airplanes.live/v2/point/${lat}/${lon}/${radius}`,
     `https://api.adsb.lol/v2/point/${lat}/${lon}/${radius}`,
     `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${radius}`,
   ];
@@ -448,22 +504,23 @@ async function api(req, res, url) {
   const parts = url.pathname.split('/').filter(Boolean); // ['api', ...]
 
   // GET /api/ac/:tail?since=unix -> current position + track since `since`
+  // Client reads from cache only - does NOT trigger polling
   if (req.method === 'GET' && parts[1] === 'ac' && parts[2]) {
-    const tail = decodeURIComponent(parts[2]).toUpperCase();
+    const tail = normalizeTail(decodeURIComponent(parts[2]));
     if (!TAIL_RE.test(tail)) return json(res, 400, { error: 'bad tail' });
     const e = entry(tail);
     e.activeUntil = Math.max(e.activeUntil, now() + WATCH_TTL);
-    if (now() - e.lastPoll >= POLL_MS / 1000) await poll(tail);
+    // Do NOT poll here - client reads from shared poller's cache
     const since = Number(url.searchParams.get('since')) || 0;
     return json(res, 200, { tail, ac: e.ac, track: e.track.filter((p) => p[0] > since), feedOk: e.feedOk, polledAt: e.lastPoll });
   }
 
   // GET /api/traffic/:tail -> nearby traffic for this aircraft
   if (req.method === 'GET' && parts[1] === 'traffic' && parts[2]) {
-    const tail = decodeURIComponent(parts[2]).toUpperCase();
+    const tail = normalizeTail(decodeURIComponent(parts[2]));
     if (!TAIL_RE.test(tail)) return json(res, 400, { error: 'bad tail' });
     const e = entry(tail);
-    if (!e.ac || !e.ac.visible || num(e.ac.lat) == null || num(e.ac.lon) == null) {
+    if (!e.ac || num(e.ac.lat) == null || num(e.ac.lon) == null) {
       return json(res, 200, { traffic: [], nearest: null });
     }
     
@@ -490,11 +547,12 @@ async function api(req, res, url) {
   // POST /api/track/end {tail} — pilot ended it
   if (req.method === 'POST' && parts[1] === 'track') {
     const body = await readBody(req);
-    const tail = String(body.tail || '').toUpperCase();
+    const tail = normalizeTail(String(body.tail || ''));
     if (!TAIL_RE.test(tail)) return json(res, 400, { error: 'bad tail' });
     const e = entry(tail);
     if (parts[2] === 'end') e.activeUntil = now() + 60;
-    else { e.activeUntil = Math.max(e.activeUntil, now() + PILOT_TTL); if (now() - e.lastPoll > 2) poll(tail); }
+    else { e.activeUntil = Math.max(e.activeUntil, now() + PILOT_TTL); }
+    // Polling happens in shared background poller, not per-request
     return json(res, 200, { ok: true });
   }
 
