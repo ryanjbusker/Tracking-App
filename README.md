@@ -445,11 +445,51 @@ You don't need to fill out metadata yet - we'll test in TestFlight first.
 9. Note the **Key ID** (shows in the table, e.g., `2X9R4HXF34`)
 10. Note the **Issuer ID** (at the top of the page, e.g., `57246542-96fe-1a63-e053-0824d011072a`)
 
-### Step 4: Add GitHub Secrets
+### Step 4: Create Private Git Repository for Code Signing
 
-Go to your GitHub repository → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
+Fastlane match stores your code signing certificates and provisioning profiles in a private Git repository, so they can be reused across builds.
 
-Add these secrets (exact names required):
+1. Go to GitHub → Click **+** → **New repository**
+2. **Name**: `contrail-certificates` (or any name you prefer)
+3. **Visibility**: **Private** (IMPORTANT: must be private for security)
+4. Click **Create repository**
+5. Copy the repository URL (e.g., `https://github.com/ryanjbusker/contrail-certificates`)
+
+**Note:** This repository will store encrypted certificates. Never make it public.
+
+### Step 5: Generate Personal Access Token for Match
+
+Fastlane match needs access to your private certificates repository.
+
+1. Go to GitHub → **Settings** (your user settings, top right)
+2. **Developer settings** (bottom of left sidebar)
+3. **Personal access tokens** → **Tokens (classic)**
+4. Click **Generate new token** → **Generate new token (classic)**
+5. **Note**: `Fastlane Match - Contrail`
+6. **Expiration**: Choose expiration (90 days, 1 year, or no expiration)
+7. **Scopes**: Check **repo** (full control of private repositories)
+8. Click **Generate token**
+9. **Copy the token immediately** (you won't see it again!)
+10. Convert to Base64:
+    - **On Windows:** Open PowerShell and run:
+      ```powershell
+      [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("YOUR_GITHUB_USERNAME:YOUR_TOKEN_HERE"))
+      ```
+    - **On Mac/Linux:**
+      ```bash
+      echo -n "YOUR_GITHUB_USERNAME:YOUR_TOKEN_HERE" | base64
+      ```
+    - Example: If your username is `ryanjbusker` and token is `ghp_abc123`, run:
+      ```powershell
+      [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("ryanjbusker:ghp_abc123"))
+      ```
+    - Save this Base64 string - you'll need it for `MATCH_GIT_BASIC_AUTHORIZATION`
+
+### Step 6: Add GitHub Secrets
+
+Go to your **Contrail** repository → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
+
+Add these secrets (**exact names required**):
 
 ```
 Secret Name: ASC_KEY_ID
@@ -475,47 +515,70 @@ Value: [Your Apple ID email, e.g., ryan@example.com]
 
 Secret Name: FASTLANE_APP_SPECIFIC_PASSWORD
 Value: [Generate at appleid.apple.com → Security → App-Specific Passwords]
-```
 
-**Optional but recommended:**
-```
+Secret Name: MATCH_GIT_URL
+Value: [URL of your private certificates repository from Step 4]
+Example: https://github.com/ryanjbusker/contrail-certificates
+
 Secret Name: MATCH_PASSWORD
-Value: [Any password - used if you want to use fastlane match later]
+Value: [Choose a strong password - this encrypts your certificates]
+Example: Use a password manager to generate a random 20+ character password
+IMPORTANT: Save this password securely - you need it for every build
 
+Secret Name: MATCH_GIT_BASIC_AUTHORIZATION
+Value: [Base64 encoded GitHub credentials from Step 5]
+Example: cnlhbmpiYnVza2VyOmdocF9hYmMxMjM...
+```
+
+**Optional:**
+```
 Secret Name: KEYCHAIN_PASSWORD  
 Value: [Any password - used for temporary keychain, default: 'temporary']
 ```
 
-### Step 5: Run the GitHub Actions Workflow
+**Total Required Secrets: 9**
+- ASC_KEY_ID
+- ASC_ISSUER_ID
+- ASC_KEY_P8
+- APPLE_TEAM_ID
+- APPLE_ID
+- FASTLANE_APP_SPECIFIC_PASSWORD
+- MATCH_GIT_URL
+- MATCH_PASSWORD
+- MATCH_GIT_BASIC_AUTHORIZATION
+
+### Step 7: Run the GitHub Actions Workflow
 
 1. Go to your GitHub repository
 2. Click **Actions** tab
 3. Click **iOS Build and Deploy** workflow (left sidebar)
 4. Click **Run workflow** (right side)
-5. Select branch: `cursor/native-app-push-notifications-90c8`
+5. Select branch: `main` (or your working branch)
 6. Keep "Upload to TestFlight" checked
 7. Click **Run workflow**
+
+**First Run Only:** The workflow will create your distribution certificate and provisioning profile, then store them encrypted in your private certificates repository. This takes about **20-25 minutes**.
+
+**Subsequent Runs:** The workflow reuses the existing certificate and profile from the git repository. This takes about **15-20 minutes**.
 
 The workflow will:
 - ✅ Install dependencies
 - ✅ Sync Capacitor
 - ✅ Install CocoaPods
 - ✅ Auto-increment build number
-- ✅ Get certificates and provisioning profiles
+- ✅ Sync certificates and profiles with match (reuses existing)
 - ✅ Build release IPA
 - ✅ Upload to TestFlight
 
-This takes about **15-20 minutes** on GitHub's macOS runners.
-
-### Step 6: Install from TestFlight
+### Step 8: Install from TestFlight
 
 1. Install **TestFlight** app on your iPhone (from App Store)
-2. After workflow completes (15-20 min), wait **5-15 minutes** for Apple to process
+2. After workflow completes (15-25 min), wait **5-15 minutes** for Apple to process
 3. Open TestFlight app
 4. You'll see **Contrail** - tap **Install**
 5. Test the app!
 
-### Step 7: Create APNs Key and Configure Render
+### Step 9: Create APNs Key and Configure Render
 
 Now that you can test on device:
 
@@ -545,6 +608,28 @@ Now that you can test on device:
 
 ### Troubleshooting
 
+**Workflow fails at "Get/sync certificates with match":**
+- Check MATCH_GIT_URL points to your private certificates repository
+- Verify MATCH_GIT_BASIC_AUTHORIZATION is correct:
+  - Must be Base64 encoded `username:token`
+  - Token must have `repo` scope
+  - Test: `echo "BASE64_STRING" | base64 --decode` should show `username:token`
+- Ensure MATCH_PASSWORD is set (required for encrypting certificates)
+- Check the certificates repository is private
+- First run: match creates certificates (takes longer)
+- Subsequent runs: match reuses existing certificates (faster)
+
+**"Could not find a matching code signing identity" error:**
+- This is normal on first run - match will create the certificate
+- On subsequent runs, check MATCH_PASSWORD matches the password used on first run
+- Verify MATCH_GIT_BASIC_AUTHORIZATION has access to the certificates repository
+
+**"Authentication failed" for git repository:**
+- Regenerate your Personal Access Token (GitHub Settings → Developer settings)
+- Ensure token has `repo` scope (full control of private repositories)
+- Re-encode to Base64: `echo -n "username:token" | base64` (Mac/Linux) or PowerShell command (Windows)
+- Update MATCH_GIT_BASIC_AUTHORIZATION secret
+
 **Workflow fails at "Get certificates":**
 - Check all secrets are set correctly
 - Verify APPLE_ID and APPLE_TEAM_ID match your account
@@ -566,6 +651,11 @@ Now that you can test on device:
 **Build increments incorrectly:**
 - Workflow uses `latest_testflight_build_number` + 1
 - First build will be build 1, then 2, 3, etc.
+
+**"Maximum number of certificates reached" error:**
+- This should NOT happen anymore with match (it reuses certificates)
+- If you see this, match isn't working correctly
+- Check MATCH_GIT_URL and MATCH_GIT_BASIC_AUTHORIZATION secrets
 
 ### Future Builds
 
@@ -593,17 +683,24 @@ Full metadata guide in the main checklist above.
 ✅ Create App ID in Developer Portal (com.ryanbusker.contrail with Push)
 ✅ Create App in App Store Connect
 ✅ Generate App Store Connect API Key (.p8 file)
-✅ Add 6 GitHub Secrets (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8, APPLE_TEAM_ID, APPLE_ID, FASTLANE_APP_SPECIFIC_PASSWORD)
-✅ Run GitHub Actions workflow
+✅ Create private GitHub repository for certificates storage
+✅ Generate GitHub Personal Access Token with repo scope
+✅ Add 9 GitHub Secrets:
+   - ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8
+   - APPLE_TEAM_ID, APPLE_ID, FASTLANE_APP_SPECIFIC_PASSWORD
+   - MATCH_GIT_URL, MATCH_PASSWORD, MATCH_GIT_BASIC_AUTHORIZATION
+✅ Run GitHub Actions workflow (first run creates certificates, reused after)
 ✅ Install from TestFlight on iPhone
 ✅ Create APNs Key and set Render env vars
 ✅ Test push notifications
 ✅ Submit for App Review when ready
 ```
 
-**Total time: ~1 hour for setup, then 15-20 min per build**
+**Total time: ~1-2 hours for setup, then 15-20 min per build**
 
 **Cost: $99/year (Apple Developer) + GitHub Actions free tier (2000 min/month macOS builds)**
+
+**Certificate Reuse:** ✅ Certificates stored in private git repo, reused across all builds
 
 ## Future: Android Support
 
