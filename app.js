@@ -581,14 +581,58 @@ function viewFly() {
 
   const last = a.track[a.track.length - 1];
   const map = makeMap($('#map'), last ? [last[1], last[2]] : DEMO_ORIGIN, last ? 13 : 10);
-  const trail = L.polyline(a.track.map((q) => [q[1], q[2]]), { color: a.color, weight: 4, opacity: 0.9 }).addTo(map);
+  const trail = L.polyline(a.track.map((q) => [q[1], q[2]]), { 
+    color: a.color, weight: 4, opacity: 0.9, lineCap: 'round', lineJoin: 'round' 
+  }).addTo(map);
   if (a.track[0]) L.marker([a.track[0][1], a.track[0][2]], { icon: dotIcon(a.color), interactive: false }).addTo(map);
   let marker = null;
   let follow = true;
   let centered = !!last;
+  
+  // Smooth marker animation
+  let animFrame = null;
+  let targetPos = null;
+  let currentPos = null;
+  
   const placeMarker = (ll, trk) => {
-    if (!marker) marker = L.marker(ll, { icon: planeIcon(a.color, trk, true), interactive: false, zIndexOffset: 1000 }).addTo(map);
-    else { marker.setLatLng(ll); marker.setIcon(planeIcon(a.color, trk, true)); }
+    if (!marker) {
+      marker = L.marker(ll, { icon: planeIcon(a.color, trk, true), interactive: false, zIndexOffset: 1000 }).addTo(map);
+      currentPos = ll;
+    } else {
+      targetPos = ll;
+      marker.setIcon(planeIcon(a.color, trk, true));
+      
+      // Smoothly animate to new position over 3 seconds
+      if (!animFrame && currentPos) {
+        const startPos = currentPos;
+        const startTime = Date.now();
+        const duration = 3000;
+        
+        const animate = () => {
+          const elapsed = Date.now() - startTime;
+          const t = Math.min(elapsed / duration, 1);
+          // Ease-out interpolation
+          const ease = 1 - Math.pow(1 - t, 3);
+          
+          const lat = startPos[0] + (targetPos[0] - startPos[0]) * ease;
+          const lon = startPos[1] + (targetPos[1] - startPos[1]) * ease;
+          const pos = [lat, lon];
+          
+          marker.setLatLng(pos);
+          currentPos = pos;
+          
+          if (t < 1) {
+            animFrame = requestAnimationFrame(animate);
+          } else {
+            animFrame = null;
+            currentPos = targetPos;
+          }
+        };
+        
+        animate();
+      }
+    }
+    
     if (!centered) { map.setView(ll, 13); centered = true; }
     else if (follow) map.panTo(ll, { animate: true });
   };
@@ -627,9 +671,9 @@ function viewFly() {
       save();
       placeMarker([ad.lat, ad.lon], ad.trk);
       
-      // Add track point if enough time has passed
+      // Add every transponder update to track (no throttling)
       const lastPt = a.track[a.track.length - 1];
-      if (!lastPt || ad.t - lastPt[0] >= MIN_STEP) {
+      if (!lastPt || ad.t > lastPt[0]) {
         const pt = [ad.t, +ad.lat.toFixed(5), +ad.lon.toFixed(5), 
                      ad.alt == null || ad.ground ? 0 : Math.round(ad.alt), 
                      ad.gs == null ? null : Math.round(ad.gs), 
@@ -736,7 +780,7 @@ function viewFly() {
   apiPost('/track', { tail: a.tail });
   pollAdsb();
   const register = setInterval(() => apiPost('/track', { tail: a.tail }), 5 * 60 * 1000);
-  const adsbTimer = setInterval(pollAdsb, 10000);
+  const adsbTimer = setInterval(pollAdsb, 3000);
 
   const flushTimer = setInterval(flush, (p.interval || 30) * 1000);
   const clock = setInterval(paint, 1000);
@@ -793,8 +837,11 @@ function viewTrack(ch, nameHint) {
     </div>`;
 
   const map = makeMap($('#map'), DEMO_ORIGIN, 9);
-  const trail = L.polyline([], { weight: 4, opacity: 0.9 }).addTo(map);
+  const trail = L.polyline([], { weight: 4, opacity: 0.9, lineCap: 'round', lineJoin: 'round' }).addTo(map);
   let marker = null, startMarker = null;
+  let animFrame = null;
+  let targetPos = null;
+  let currentPos = null;
   map.on('dragstart', () => { follow = false; $('#follow').classList.remove('is-on'); });
   $('#layers').onclick = () => map.cycleLayer();
   $('#follow').onclick = () => {
@@ -874,8 +921,48 @@ function viewTrack(ch, nameHint) {
     trail.setStyle({ color });
     trail.setLatLngs(lls);
     const icon = planeIcon(color, lastPt[5], st === 'live');
-    if (!marker) marker = L.marker(here, { icon, interactive: false, zIndexOffset: 1000 }).addTo(map);
-    else { marker.setLatLng(here); marker.setIcon(icon); }
+    
+    if (!marker) {
+      marker = L.marker(here, { icon, interactive: false, zIndexOffset: 1000 }).addTo(map);
+      currentPos = here;
+    } else {
+      targetPos = here;
+      marker.setIcon(icon);
+      
+      // Smoothly animate to new position over 3 seconds
+      if (!animFrame && currentPos && (targetPos[0] !== currentPos[0] || targetPos[1] !== currentPos[1])) {
+        const startPos = currentPos;
+        const startTime = Date.now();
+        const duration = 3000;
+        
+        const animate = () => {
+          const elapsed = Date.now() - startTime;
+          const t = Math.min(elapsed / duration, 1);
+          // Ease-out interpolation
+          const ease = 1 - Math.pow(1 - t, 3);
+          
+          const lat = startPos[0] + (targetPos[0] - startPos[0]) * ease;
+          const lon = startPos[1] + (targetPos[1] - startPos[1]) * ease;
+          const pos = [lat, lon];
+          
+          marker.setLatLng(pos);
+          currentPos = pos;
+          
+          if (t < 1) {
+            animFrame = requestAnimationFrame(animate);
+          } else {
+            animFrame = null;
+            currentPos = targetPos;
+          }
+        };
+        
+        animate();
+      } else if (!animFrame) {
+        marker.setLatLng(here);
+        currentPos = here;
+      }
+    }
+    
     if (!startMarker) startMarker = L.marker(lls[0], { icon: dotIcon(color), interactive: false }).addTo(map);
     else startMarker.setLatLng(lls[0]);
 
@@ -956,7 +1043,7 @@ function viewTrack(ch, nameHint) {
     adsbBusy = true;
     try { await pollAdsb(); } finally { adsbBusy = false; }
   };
-  const adsbTimer = setInterval(adsbTick, 5000);
+  const adsbTimer = setInterval(adsbTick, 3000);
   const adsbFirst = setTimeout(adsbTick, 1500); // after the ntfy backlog tells us the tail number
   cleanup.push(() => { es.close(); clearInterval(tick); clearInterval(adsbTimer); clearTimeout(adsbFirst); clearTimeout(pending); });
   renderPanel();

@@ -23,8 +23,9 @@ const APNS_TEAM_ID = process.env.APNS_TEAM_ID;
 const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID;
 const APNS_KEY = process.env.APNS_KEY; // .p8 file contents
 const APNS_ENV = process.env.APNS_ENV || 'production'; // 'sandbox' or 'production'
-const POLL_MS = 5000;              // how often each active tail is polled
-const MIN_STEP = 4;                // seconds between stored track points
+const POLL_MS = 3000;              // how often each active tail is polled
+const CACHE_MS = 2000;             // cache feed results to avoid hammering APIs
+const MIN_STEP = 0;                // store every point (no throttling)
 const KEEP_SEC = 8 * 3600;         // how much track history to keep in memory
 const PILOT_TTL = 5 * 3600;        // a started flight is polled for up to 5 h unless ended
 const WATCH_TTL = 10 * 60;         // a watcher keeps a tail polled for 10 min after its last request
@@ -252,8 +253,10 @@ const now = () => Math.floor(Date.now() / 1000);
 const num = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
 
 /* ---------- ADS-B tracking ---------- */
-// tail -> { activeUntil, track: [[t, lat, lon, alt, gs, trk]], ac, lastPoll, feedOk }
+// tail -> { activeUntil, track: [[t, lat, lon, alt, gs, trk]], ac, lastPoll, feedOk, backoffUntil }
 const tails = new Map();
+// Cache feed results to avoid hammering APIs
+const feedCache = new Map(); // tail -> { data, fetchedAt }
 
 function entry(tail) {
   let e = tails.get(tail);
@@ -262,18 +265,33 @@ function entry(tail) {
       const oldest = [...tails].sort((a, b) => a[1].activeUntil - b[1].activeUntil)[0];
       tails.delete(oldest[0]);
     }
-    e = { activeUntil: 0, track: [], ac: null, lastPoll: 0, feedOk: null };
+    e = { activeUntil: 0, track: [], ac: null, lastPoll: 0, feedOk: null, backoffUntil: 0 };
     tails.set(tail, e);
   }
   return e;
 }
 
 async function fetchFeed(tail) {
+  // Check cache first (2s TTL)
+  const cached = feedCache.get(tail);
+  if (cached && Date.now() - cached.fetchedAt < CACHE_MS) {
+    return cached.data;
+  }
+
   for (const url of FEEDS) {
     try {
       const res = await fetch(url(tail), { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) });
+      if (res.status === 429) {
+        // Rate limited - back off for 10 seconds
+        const e = entry(tail);
+        e.backoffUntil = Date.now() + 10000;
+        return null;
+      }
       if (!res.ok) continue;
-      return await res.json();
+      const data = await res.json();
+      // Cache successful result
+      feedCache.set(tail, { data, fetchedAt: Date.now() });
+      return data;
     } catch {}
   }
   return null;
@@ -281,6 +299,9 @@ async function fetchFeed(tail) {
 
 async function poll(tail) {
   const e = entry(tail);
+  // Respect backoff period
+  if (e.backoffUntil && Date.now() < e.backoffUntil) return;
+  
   e.lastPoll = now();
   const data = await fetchFeed(tail);
   e.feedOk = !!data;
