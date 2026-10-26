@@ -2,7 +2,6 @@
   "appId": "com.ryanbusker.contrail",
   "appName": "Contrail",
   "webDir": "www",
-  "bundledWebRuntime": false,
   "plugins": {
     "PushNotifications": {
       "presentationOptions": ["badge", "sound", "alert"]
