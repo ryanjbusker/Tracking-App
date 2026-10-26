@@ -684,62 +684,53 @@ function viewFly() {
   }
 
   function paint() {
-    const f = live.fix && Date.now() - live.fix.ms < 30000 ? live.fix : null;
     const ad = live.adsb && now() - live.adsb.t < ADSB_FRESH ? live.adsb : null;
-    const alt = f?.alt ?? ad?.alt, gs = f?.gs ?? ad?.gs, trk = live.trk ?? ad?.trk;
+    const alt = ad?.alt, gs = ad?.gs, trk = ad?.trk;
     $('#elapsed').textContent = fmtDur(now() - a.start);
-    $('#s-alt').innerHTML = !f && ad?.ground ? 'GND' : alt != null ? `${Math.round(alt).toLocaleString()}<u>ft</u>` : '—';
+    $('#s-alt').innerHTML = ad?.ground ? 'GND' : alt != null ? `${Math.round(alt).toLocaleString()}<u>ft</u>` : '—';
     $('#s-gs').innerHTML = gs != null ? `${Math.round(gs)}<u>kt</u>` : '—';
     $('#s-trk').innerHTML = trk != null ? `${fmtHdg(trk)}°` : '—';
     $('#s-dist').innerHTML = `${a.dist.toFixed(a.dist < 10 ? 1 : 0)}<u>nm</u>`;
 
-    const pending = outbox.pending() + a.buf.length;
-    const phoneOk = f && outbox.ok;
-    const state = ad || phoneOk ? 'live' : f || live.adsb ? 'stale' : 'idle';
+    const state = ad ? 'live' : live.adsb ? 'stale' : 'idle';
     const st = $('#st');
     st.className = `status ${state}`;
-    st.innerHTML = `<i></i>${{ idle: 'Starting', live: 'Live', stale: 'No signal' }[state]}`;
+    st.innerHTML = `<i></i>${{ idle: 'Searching', live: 'Live', stale: 'No signal' }[state]}`;
 
     const chip = (el, cls, text) => { el.className = `src ${cls}`; el.innerHTML = `<i></i>${text}`; };
-    chip($('#src-adsb'), ad ? 'on' : live.adsb ? 'warn' : '',
-      live.apiOk === false ? 'Transponder: unavailable'
-        : ad ? `Transponder · ${ago(ad.t)}`
-        : live.adsb ? `Transponder · last ${ago(live.adsb.t)}`
-        : live.apiOk == null ? 'Transponder · checking…' : 'Transponder · not seen yet');
-    chip($('#src-gps'), !useGps ? '' : phoneOk ? 'on' : f || live.fix ? 'warn' : '',
-      !useGps ? 'Phone GPS · off'
-        : live.gpsErr === 'denied' ? 'Phone GPS · blocked'
-        : !live.fix ? 'Phone GPS · finding…'
-        : !outbox.ok ? `Phone GPS · ${pending} queued`
-        : p.demo ? 'Phone GPS · demo'
-        : `Phone GPS · ±${Math.round(live.fix.acc)} m`);
+    if (live.apiOk === false) {
+      chip($('#src-adsb'), 'warn', 'Transponder: server unavailable');
+    } else if (ad) {
+      chip($('#src-adsb'), 'on', `Transponder · ${ago(ad.t)}`);
+    } else if (live.adsb) {
+      const minAgo = Math.floor((now() - live.adsb.t) / 60);
+      chip($('#src-adsb'), 'warn', `No transponder signal, last seen ${minAgo} min ago`);
+    } else if (live.apiOk == null) {
+      chip($('#src-adsb'), '', 'Transponder · checking…');
+    } else {
+      chip($('#src-adsb'), '', 'Transponder · not seen yet');
+    }
 
     let banner = '';
-    if (useGps && live.gpsErr === 'denied') banner = `<div class="banner">${I.alert}<span>Location is blocked for this site. Allow location access in your phone’s settings, then reopen Contrail.</span></div>`;
-    else if (ad) banner = now() - a.start < 600 ? `<div class="banner info">${I.check}<span>Your transponder is being tracked. You can lock your phone and it’ll keep working.</span></div>` : '';
-    else if (live.gpsErr === 'unsupported') banner = `<div class="banner">${I.alert}<span>This browser can’t share location.</span></div>`;
-    else if (live.gap) banner = `<div class="banner">${I.alert}<span>Tracking paused while Contrail was in the background. Keep it open with the screen on.</span></div>`;
-    else if (!outbox.ok) banner = `<div class="banner">${I.alert}<span>No data connection. Points are saved and will send when you’re back in coverage.</span></div>`;
-    else if (useGps && now() - a.start < 600) banner = `<div class="banner info">${I.alert}<span>Transponder not picked up yet (normal on the ground). Keep Contrail open with the screen on until it is, so phone GPS can cover.</span></div>`;
+    if (ad && now() - a.start < 600) {
+      banner = `<div class="banner info">${I.check}<span>Your transponder is being tracked. You can lock your phone.</span></div>`;
+    } else if (!ad && live.adsb && now() - live.adsb.t > 300) {
+      const minAgo = Math.floor((now() - live.adsb.t) / 60);
+      banner = `<div class="banner">${I.alert}<span>No transponder signal for ${minAgo} minutes. Make sure your transponder is on.</span></div>`;
+    } else if (!ad && !live.adsb && now() - a.start > 600) {
+      banner = `<div class="banner">${I.alert}<span>Transponder not detected. Make sure it's on and set to ALT mode.</span></div>`;
+    }
     const b = $('#banner');
     if (b.innerHTML !== banner) b.innerHTML = banner;
   }
 
   const onVis = () => {
-    if (document.visibilityState === 'hidden') { live.hiddenAt = Date.now(); return; }
-    if (useGps && live.hiddenAt && Date.now() - live.hiddenAt > 30000) live.gap = true;
-    if (useGps) keepAwake();
+    if (document.visibilityState === 'hidden') return;
     pollAdsb();
-    flush();
   };
   document.addEventListener('visibilitychange', onVis);
   cleanup.push(() => document.removeEventListener('visibilitychange', onVis));
 
-  if (useGps) {
-    cleanup.push(p.demo ? startSim(onFix, a.start) : startGps(onFix, onGpsErr));
-    keepAwake();
-    cleanup.push(() => { wakeLock?.release(); wakeLock = null; });
-  }
 
   // Ask the server to follow this tail; repeat in case it restarted (free hosting sleeps).
   apiPost('/track', { tail: a.tail });
