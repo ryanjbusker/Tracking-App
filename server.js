@@ -23,8 +23,9 @@ const APNS_TEAM_ID = process.env.APNS_TEAM_ID;
 const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID;
 const APNS_KEY = process.env.APNS_KEY; // .p8 file contents
 const APNS_ENV = process.env.APNS_ENV || 'production'; // 'sandbox' or 'production'
-const POLL_MS = 3000;              // server polls feeds every 3s (shared poller)
-const CACHE_MS = 2500;             // cache feed results (clients read from cache only)
+const ADSBX_KEY = process.env.ADSBX_RAPIDAPI_KEY;
+const POLL_MS = 4000;              // poll active flights every 4s
+const CACHE_MS = 3500;             // cache results
 const MIN_STEP = 0;                // store every point when position changes
 const KEEP_SEC = 8 * 3600;         // how much track history to keep in memory
 const PILOT_TTL = 5 * 3600;        // a started flight is polled for up to 5 h unless ended
@@ -32,12 +33,21 @@ const WATCH_TTL = 10 * 60;         // a watcher keeps a tail polled for 10 min a
 const MAX_TAILS = 100;
 const UA = 'contrail-flight-tracker (+https://github.com/ryanjbusker/Tracking-App)';
 
-// Multiple feed sources with per-host backoff
+// ADS-B Exchange via RapidAPI (paid, primary when key is set)
+const ADSBX_HOST = 'adsbexchange-com1.p.rapidapi.com';
+const ADSBX_BASE = `https://${ADSBX_HOST}`;
+
+// Free feed sources (fallback)
 const FEEDS = {
   'adsb.lol': (reg) => `https://api.adsb.lol/v2/reg/${reg}`,
   'adsb.fi': (reg) => `https://opendata.adsb.fi/api/v2/registration/${reg}`,
 };
 const feedBackoff = {}; // host -> backoffUntil timestamp
+
+// Request tracking
+let monthlyRequests = 0;
+let requestMonth = new Date().getMonth();
+const REQUEST_CAP = 20000; // Safety cap per month
 
 const TAIL_RE = /^[A-Z0-9-]{2,8}$/;
 
@@ -48,6 +58,23 @@ function normalizeTail(tail) {
   // Add N prefix if starts with digit (common for US registrations)
   if (/^\d/.test(t) && !t.startsWith('N')) t = 'N' + t;
   return t;
+}
+
+// Track monthly requests
+function incrementRequests() {
+  const currentMonth = new Date().getMonth();
+  if (currentMonth !== requestMonth) {
+    // New month - reset counter
+    monthlyRequests = 0;
+    requestMonth = currentMonth;
+    console.log(`[ADSBX] New month, reset counter to 0`);
+  }
+  monthlyRequests++;
+  return monthlyRequests;
+}
+
+function canMakeRequest() {
+  return monthlyRequests < REQUEST_CAP;
 }
 
 /* ---------- Database ---------- */
@@ -279,10 +306,66 @@ function entry(tail) {
       const oldest = [...tails].sort((a, b) => a[1].activeUntil - b[1].activeUntil)[0];
       tails.delete(oldest[0]);
     }
-    e = { activeUntil: 0, track: [], ac: null, lastPoll: 0, feedOk: null, backoffUntil: 0 };
+    e = { activeUntil: 0, track: [], ac: null, lastPoll: 0, feedOk: null, hex: null, traffic: [] };
     tails.set(tail, e);
   }
   return e;
+}
+
+// Fetch from ADS-B Exchange (paid, efficient combined query)
+async function fetchADSBX(tail, lat, lon, hex) {
+  if (!ADSBX_KEY || !canMakeRequest()) return null;
+  
+  // Check cache first
+  const cacheKey = lat && lon ? `${tail}:${lat.toFixed(3)}:${lon.toFixed(3)}` : tail;
+  const cached = feedCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < CACHE_MS) {
+    return cached.data;
+  }
+  
+  let url, endpoint;
+  
+  // Strategy: Use radius search if we have position (gets plane + traffic in one call)
+  if (lat != null && lon != null) {
+    url = `${ADSBX_BASE}/v2/lat/${lat}/lon/${lon}/dist/10/`;
+    endpoint = 'radius';
+  } else if (hex) {
+    url = `${ADSBX_BASE}/v2/hex/${hex}/`;
+    endpoint = 'hex';
+  } else {
+    url = `${ADSBX_BASE}/v2/registration/${tail}/`;
+    endpoint = 'registration';
+  }
+  
+  try {
+    const count = incrementRequests();
+    console.log(`[${tail}] ADSBX ${endpoint} query #${count}`);
+    
+    const res = await fetch(url, {
+      headers: {
+        'X-RapidAPI-Key': ADSBX_KEY,
+        'X-RapidAPI-Host': ADSBX_HOST,
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.error(`[${tail}] ADSBX HTTP ${res.status}: ${text.slice(0, 100)}`);
+      return null;
+    }
+    
+    const data = await res.json();
+    
+    // Cache successful result
+    feedCache.set(cacheKey, { data, fetchedAt: Date.now() });
+    console.log(`[${tail}] ADSBX OK, ${data.ac?.length || 0} aircraft`);
+    return data;
+    
+  } catch (err) {
+    console.error(`[${tail}] ADSBX error: ${err.message}`);
+    return null;
+  }
 }
 
 async function fetchFeed(tail) {
@@ -349,21 +432,42 @@ async function poll(tail) {
   const e = entry(tail);
   
   e.lastPoll = now();
-  const data = await fetchFeed(tail);
+  
+  // Try ADSBX first (combined query for position + traffic)
+  let data = null;
+  if (ADSBX_KEY && canMakeRequest()) {
+    // Use radius search if we have last known position (efficient: gets plane + traffic)
+    if (e.ac && e.ac.lat != null && e.ac.lon != null) {
+      data = await fetchADSBX(tail, e.ac.lat, e.ac.lon, e.hex);
+    } else if (e.hex) {
+      data = await fetchADSBX(tail, null, null, e.hex);
+    } else {
+      data = await fetchADSBX(tail, null, null, null);
+    }
+  }
+  
+  // Fallback to free feeds if ADSBX failed
+  if (!data) {
+    data = await fetchFeed(tail);
+  }
+  
   e.feedOk = !!data;
   
   // Keep last known position when feeds fail, mark as stale
   if (!data) {
-    if (e.ac) e.ac.visible = false; // Mark as stale but keep position
+    if (e.ac) e.ac.visible = false;
     return;
   }
   
   const list = Array.isArray(data.ac) ? data.ac : [];
-  const ac = list.find((a) => (a.r || '').toUpperCase() === tail) || list[0];
+  const ac = list.find((a) => (a.r || '').toUpperCase() === tail || (e.hex && a.hex === e.hex)) || list[0];
   if (!ac || num(ac.lat) == null || num(ac.lon) == null) { 
     if (e.ac) e.ac.visible = false; 
     return; 
   }
+  
+  // Remember hex for future queries
+  if (ac.hex) e.hex = ac.hex;
 
   const feedNow = num(data.now) ? data.now / 1000 : Date.now() / 1000;
   const t = Math.round(feedNow - (num(ac.seen_pos) ?? num(ac.seen) ?? 0));
@@ -375,6 +479,27 @@ async function poll(tail) {
     hex: ac.hex, type: ac.t || null, desc: ac.desc || null, squawk: ac.squawk || null,
     t, lat: ac.lat, lon: ac.lon, alt, ground, gs, trk,
   };
+  
+  // Extract traffic from same response (radius search returns nearby aircraft)
+  if (list.length > 1) {
+    e.traffic = list
+      .filter((a) => a.hex !== e.hex && num(a.lat) != null && num(a.lon) != null)
+      .slice(0, 10)
+      .map((a) => ({
+        tail: a.r?.toUpperCase() || null,
+        callsign: a.flight?.trim() || null,
+        hex: a.hex,
+        lat: a.lat,
+        lon: a.lon,
+        alt: num(a.alt_baro) ?? num(a.alt_geom) ?? 0,
+        gs: num(a.gs) ?? 0,
+        trk: num(a.track) ?? num(a.true_heading) ?? 0,
+        vs: num(a.baro_rate) ?? 0,
+      }));
+  } else {
+    e.traffic = [];
+  }
+  
   // Only store point if position actually changed (dedupe identical feed samples)
   const last = e.track[e.track.length - 1];
   const lat = +ac.lat.toFixed(5), lon = +ac.lon.toFixed(5);
@@ -514,6 +639,7 @@ async function api(req, res, url) {
   }
 
   // GET /api/traffic/:tail -> nearby traffic for this aircraft
+  // Traffic is now extracted from the same poll() query (efficient)
   if (req.method === 'GET' && parts[1] === 'traffic' && parts[2]) {
     const tail = normalizeTail(decodeURIComponent(parts[2]));
     if (!TAIL_RE.test(tail)) return json(res, 400, { error: 'bad tail' });
@@ -522,10 +648,8 @@ async function api(req, res, url) {
       return json(res, 200, { traffic: [], nearest: null });
     }
     
-    const traffic = await fetchTraffic(tail, e.ac.lat, e.ac.lon);
-    
-    // Calculate distances and bearings
-    const enriched = traffic.map((a) => {
+    // Use traffic from last poll() (already extracted from radius query)
+    const enriched = e.traffic.map((a) => {
       const dist = distanceNm(e.ac.lat, e.ac.lon, a.lat, a.lon);
       const bearing = bearingTo(e.ac.lat, e.ac.lon, a.lat, a.lon);
       const relAlt = a.alt - (e.ac.alt || 0);
@@ -539,6 +663,21 @@ async function api(req, res, url) {
     
     const nearest = enriched[0] || null;
     return json(res, 200, { traffic: enriched.slice(0, 10), nearest });
+  }
+
+  // GET /api/health -> server health and request stats
+  if (req.method === 'GET' && parts[1] === 'health') {
+    return json(res, 200, {
+      ok: true,
+      adsbx: {
+        enabled: !!ADSBX_KEY,
+        monthlyRequests,
+        requestCap: REQUEST_CAP,
+        remaining: REQUEST_CAP - monthlyRequests,
+      },
+      activeTails: tails.size,
+      uptime: process.uptime(),
+    });
   }
 
   // POST /api/track {tail}  — pilot started a flight
