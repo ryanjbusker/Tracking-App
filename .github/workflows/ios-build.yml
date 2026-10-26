@@ -39,13 +39,9 @@ jobs:
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
-          bundler-cache: true
-          working-directory: ios/App
       
       - name: Install Fastlane
-        run: |
-          cd ios/App
-          gem install fastlane
+        run: gem install fastlane
       
       - name: Create Fastlane Appfile
         run: |
@@ -54,6 +50,18 @@ jobs:
           cat > fastlane/Appfile << EOF
           app_identifier("com.ryanbusker.contrail")
           apple_id(ENV["APPLE_ID"])
+          team_id(ENV["APPLE_TEAM_ID"])
+          EOF
+      
+      - name: Create Fastlane Matchfile
+        run: |
+          cd ios/App
+          cat > fastlane/Matchfile << EOF
+          git_url(ENV["MATCH_GIT_URL"])
+          storage_mode("git")
+          type("appstore")
+          app_identifier(["com.ryanbusker.contrail"])
+          username(ENV["APPLE_ID"])
           team_id(ENV["APPLE_TEAM_ID"])
           EOF
       
@@ -84,25 +92,20 @@ jobs:
                 ) + 1
               )
 
-              # Get certificates and provisioning profiles
-              cert(
-                api_key_path: nil,  # Will use app_store_connect_api_key
-                team_id: ENV["APPLE_TEAM_ID"]
-              )
-              
-              sigh(
-                api_key_path: nil,  # Will use app_store_connect_api_key
+              # Get/sync certificates and provisioning profiles with match
+              match(
+                type: "appstore",
                 app_identifier: "com.ryanbusker.contrail",
-                team_id: ENV["APPLE_TEAM_ID"],
-                force: true,
-                adhoc: false
+                readonly: false,
+                force_for_new_devices: true
               )
 
               # Update project provisioning
               update_project_provisioning(
                 xcodeproj: "App.xcodeproj",
                 target_filter: "App",
-                build_configuration: "Release"
+                build_configuration: "Release",
+                profile: ENV["sigh_com.ryanbusker.contrail_appstore_profile-path"]
               )
 
               # Build the app
@@ -113,7 +116,7 @@ jobs:
                 export_method: "app-store",
                 export_options: {
                   provisioningProfiles: {
-                    "com.ryanbusker.contrail" => ENV["SIGH_COM_RYANBUSKER_CONTRAIL_APPSTORE"]
+                    "com.ryanbusker.contrail" => ENV["sigh_com.ryanbusker.contrail_appstore_profile-name"]
                   }
                 }
               )
@@ -121,7 +124,6 @@ jobs:
               # Upload to TestFlight
               if ENV["UPLOAD_TO_TESTFLIGHT"] == "true"
                 upload_to_testflight(
-                  api_key_path: nil,  # Will use app_store_connect_api_key
                   skip_waiting_for_build_processing: true,
                   skip_submission: true
                 )
@@ -149,7 +151,9 @@ jobs:
           ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
+          MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD || 'temporary' }}
           UPLOAD_TO_TESTFLIGHT: ${{ github.event.inputs.upload_to_testflight || 'true' }}
           FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD: ${{ secrets.FASTLANE_APP_SPECIFIC_PASSWORD }}
