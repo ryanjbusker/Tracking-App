@@ -36,7 +36,6 @@ const UA = 'contrail-flight-tracker (+https://github.com/ryanjbusker/Tracking-Ap
 const FEEDS = {
   'adsb.lol': (reg) => `https://api.adsb.lol/v2/reg/${reg}`,
   'adsb.fi': (reg) => `https://opendata.adsb.fi/api/v2/registration/${reg}`,
-  'airplanes.live': (reg) => `https://api.airplanes.live/v2/reg/${reg}`,
 };
 const feedBackoff = {}; // host -> backoffUntil timestamp
 
@@ -396,11 +395,10 @@ async function fetchTraffic(tail, lat, lon) {
   }
 
   const radius = 10; // nm
-  // Use airplanes.live first (different host than position polling)
+  // Try adsb.fi first for traffic (load balancing with position polling)
   const urls = [
-    `https://api.airplanes.live/v2/point/${lat}/${lon}/${radius}`,
-    `https://api.adsb.lol/v2/point/${lat}/${lon}/${radius}`,
     `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${radius}`,
+    `https://api.adsb.lol/v2/point/${lat}/${lon}/${radius}`,
   ];
 
   for (const url of urls) {
