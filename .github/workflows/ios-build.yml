@@ -74,6 +74,9 @@ jobs:
           platform :ios do
             desc "Build and upload to TestFlight"
             lane :beta do
+              # Setup CI keychain (creates temp keychain for match and gym)
+              setup_ci
+              
               # Set up App Store Connect API Key
               app_store_connect_api_key(
                 key_id: ENV["ASC_KEY_ID"],
@@ -100,12 +103,15 @@ jobs:
                 force_for_new_devices: true
               )
 
-              # Update project provisioning
-              update_project_provisioning(
-                xcodeproj: "App.xcodeproj",
-                target_filter: "App",
-                build_configuration: "Release",
-                profile: ENV["sigh_com.ryanbusker.contrail_appstore_profile-path"]
+              # Update code signing settings for manual signing
+              update_code_signing_settings(
+                use_automatic_signing: false,
+                path: "App.xcodeproj",
+                targets: ["App"],
+                code_sign_identity: "iPhone Distribution",
+                bundle_identifier: "com.ryanbusker.contrail",
+                profile_name: ENV["sigh_com.ryanbusker.contrail_appstore_profile-name"],
+                team_id: ENV["APPLE_TEAM_ID"]
               )
 
               # Build the app
@@ -132,13 +138,6 @@ jobs:
           end
           EOF
       
-      - name: Create keychain
-        run: |
-          security create-keychain -p "${{ secrets.KEYCHAIN_PASSWORD || 'temporary' }}" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "${{ secrets.KEYCHAIN_PASSWORD || 'temporary' }}" build.keychain
-          security set-keychain-settings -t 3600 -u build.keychain
-      
       - name: Install CocoaPods
         run: |
           cd ios/App
@@ -154,7 +153,6 @@ jobs:
           MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
           MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD || 'temporary' }}
           UPLOAD_TO_TESTFLIGHT: ${{ github.event.inputs.upload_to_testflight || 'true' }}
           FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD: ${{ secrets.FASTLANE_APP_SPECIFIC_PASSWORD }}
         run: |
@@ -168,8 +166,3 @@ jobs:
           name: Contrail-iOS
           path: ios/App/*.ipa
           if-no-files-found: warn
-      
-      - name: Clean up keychain
-        if: always()
-        run: |
-          security delete-keychain build.keychain || true
